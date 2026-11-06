@@ -85,6 +85,14 @@ export const EXAMPLES: readonly Example[] = [
       "curl -X POST 'https://api.example.com/v2/orders' \\\n  -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsInNjb3BlIjoib3JkZXJzOndyaXRlIiwiZXhwIjoxNzkzMDAzNjAwfQ.WHCldAkgN8iBjhG-eYtSVz-m-0gHOqdCYdM96h1nlrs' \\\n  -H 'Content-Type: application/json' \\\n  -H 'Cookie: session=abc123; theme=light' \\\n  --data-raw '{\"sku\":\"TR-9\",\"qty\":2,\"gift\":false}' \\\n  --compressed -sS",
     ],
   },
+  {
+    id: "shell",
+    label: "Shell commands: options, variables, nested URLs",
+    urls: [
+      'docker run --rm -d --name api -p 8080:80 -e DATABASE_URL=\'postgres://app:secret@db.internal:5432/orders?sslmode=require&pool=10\' -e LOG_LEVEL=info -v /srv/api/config:/etc/api:ro --label \'com.example.deploy={"team":"orders","tier":"web"}\' ghcr.io/example/api:1.4.2 serve --workers 4',
+      'docker run --rm -d \\\n  --name api-canary \\\n  -p 8081:80 \\\n  -e DATABASE_URL=\'postgres://app:secret@db-replica.internal:5432/orders?sslmode=require&pool=20\' \\\n  -e LOG_LEVEL=debug \\\n  -e FEATURE_FLAGS=new-checkout,fast-search \\\n  -v /srv/api/config:/etc/api:ro \\\n  --label \'com.example.deploy={"team":"orders","tier":"canary"}\' \\\n  ghcr.io/example/api:1.5.0-rc.1 serve --workers 2',
+    ],
+  },
 ];
 
 export const EXAMPLE = EXAMPLES[0]!.urls;

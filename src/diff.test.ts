@@ -108,6 +108,17 @@ describe("treat as equal", () => {
     expect(statusOf(c, "query", "id")).toBe("diff");
     expect(statusOf(c, "method")).toBe("partial");
   });
+
+  it("lines up two shell commands by option", () => {
+    const shell = EXAMPLES.find((e) => e.id === "shell")!.urls;
+    const c = run(shell[0]!, shell[1]!);
+    expect(statusOf(c, "options", "--rm")).toBe("same");
+    expect(statusOf(c, "options", "-e", "LOG_LEVEL")).toBe("diff");
+    expect(statusOf(c, "options", "-e", "FEATURE_FLAGS")).toBe("partial");
+    expect(statusOf(c, "options", "-e", "DATABASE_URL", "host")).toBe("diff");
+    expect(statusOf(c, "options", "-e", "DATABASE_URL", "scheme")).toBe("same");
+    expect(statusOf(c, "arguments")).toBe("diff");
+  });
 });
 
 describe("charDiff", () => {

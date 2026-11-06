@@ -1,3 +1,4 @@
+import { parseCommand, splitAtOperator, type Command } from "./decoders/command.ts";
 import { base64Text } from "./decoders/compress.ts";
 import { parseCurl, SHORT_FLAGS, tokenize, type Curl, type Token } from "./decoders/curl.ts";
 import { parseJsurl, stringifyJsurl } from "./decoders/jsurl.ts";
@@ -7,6 +8,7 @@ import {
   decodePct,
   headerValue,
   parseUrl,
+  splitKey,
   type Node,
   type Options,
   type Seg,
@@ -286,7 +288,7 @@ function repeated(raw: string, list: Span[]): Editor {
       const last = list[list.length - 1]!.edit!;
       const extra = lines
         .slice(list.length)
-        .map((l) => `&${last.prefix ?? ""}${last.encode(l)}`)
+        .map((l) => `${last.sep ?? "&"}${last.prefix ?? ""}${last.encode(l)}`)
         .join("");
       if (extra) edits.push([last.range[1], last.range[1], extra]);
       return splice(raw, edits);
@@ -366,12 +368,17 @@ interface CurlCtx {
   raw: string;
   lead: number;
   c: Curl;
+  /** A control operator such as `|` and the tokens after it. */
+  tail: Token[];
 }
+
+const CURL = /^\s*curl(?:\.exe)?\s/i;
 
 function curlCtx(raw: string): CurlCtx | null {
   const lead = raw.length - raw.trimStart().length;
-  const c = parseCurl(tokenize(raw.trim()));
-  return c && { raw, lead, c };
+  const { tokens, rest } = splitAtOperator(tokenize(raw.trim()));
+  const c = parseCurl(tokens);
+  return c && { raw, lead, c, tail: rest };
 }
 
 const tokenRange = (x: CurlCtx, t: Token): [number, number] => [x.lead + t.start, x.lead + t.end];
@@ -496,26 +503,68 @@ function curlEditor(raw: string, opts: Options, path: Seg[]): Actions {
       remove: () => removeArg(x, v ?? o.token, v ? undefined : o.name),
     };
   }
+
+  if (head === "followed by" && !rest.length && x.tail.length) {
+    const range = tokenRange(x, x.tail[0]!);
+    range[1] = x.lead + x.tail[x.tail.length - 1]!.end;
+    const before = x.lead + c.tokens[c.tokens.length - 1]!.end;
+    return {
+      current: raw.slice(...range),
+      apply: (v) => splice(raw, [[...range, v]]),
+      remove: () => splice(raw, [[before, range[1], ""]]),
+    };
+  }
   return {};
 }
 
 /** Works out how the value at `path` in one input can be edited or removed. */
 export function actionsFor(raw: string, opts: Options, path: Seg[]): Actions {
-  if (/^\s*curl(?:\.exe)?\s/i.test(raw)) return curlEditor(raw, opts, path);
+  if (CURL.test(raw)) return curlEditor(raw, opts, path);
   const ed = urlEditor(raw, opts, path);
   return { ...ed, remove: ed?.remove ?? urlRemoveUnder(raw, opts, path) };
 }
 
-export type AddKind = "query" | "header";
+export type AddKind = "query" | "header" | "option" | "env";
 
-/** Returns a function that adds a query parameter or header to an input, or null if it can't. */
+/** The text that continues a command onto a new line, or a space if it is all on one line. */
+const lineBreak = (raw: string) =>
+  /\\\r?\n/.test(raw) ? " \\\n  " : /\^\r?\n/.test(raw) ? " ^\n  " : " ";
+
+/** Adds options after the first run of options, so ones meant for a subcommand or container stay last. */
+function commandAdder(raw: string, c: Command, kind: AddKind) {
+  if (kind === "env") {
+    const at = c.program.start;
+    return (k: string, v: string) => splice(raw, [[at, at, `${k}=${shellQuote(v)} `]]);
+  }
+  if (kind !== "option") return null;
+  const first = c.args.findIndex((a) => a.kind === "option");
+  const end = c.args.findIndex((a, i) => i > first && a.kind === "positional");
+  const last = first < 0 ? null : c.args[(end < 0 ? c.args.length : end) - 1]!;
+  const anchor =
+    last?.kind !== "option"
+      ? c.tokens[c.tokens.length - 1]!
+      : last.value && last.attached === undefined
+        ? last.value
+        : last.flag;
+  return (k: string, v: string) => {
+    const name = k.startsWith("-") ? k : k.length === 1 ? `-${k}` : `--${k}`;
+    const arg = v === "" ? name : name === "-D" ? shellQuote(`-D${v}`) : `${name} ${shellQuote(v)}`;
+    return splice(raw, [[anchor.end, anchor.end, lineBreak(raw) + arg]]);
+  };
+}
+
+/**
+ * Returns a function that adds a query parameter, header, option or environment variable to an
+ * input, or null if it can't.
+ */
 export function adderFor(
   raw: string,
   opts: Options,
   kind: AddKind,
 ): ((k: string, v: string) => string) | null {
-  const x = /^\s*curl(?:\.exe)?\s/i.test(raw) ? curlCtx(raw) : null;
+  const x = CURL.test(raw) ? curlCtx(raw) : null;
   if (x) {
+    if (kind === "option" || kind === "env") return null;
     if (kind === "query") {
       const url = x.c.url;
       const inner = url && adderFor(url.value, opts, "query");
@@ -524,9 +573,10 @@ export function adderFor(
     const anchor =
       x.c.headers[x.c.headers.length - 1] ?? x.c.url ?? x.c.tokens[x.c.tokens.length - 1]!;
     const at = x.lead + anchor.end;
-    const gap = raw.includes("\\\n") ? " \\\n  " : " ";
-    return (k, v) => splice(raw, [[at, at, `${gap}-H ${shellQuote(`${k}: ${v}`)}`]]);
+    return (k, v) => splice(raw, [[at, at, `${lineBreak(raw)}-H ${shellQuote(`${k}: ${v}`)}`]]);
   }
+  const cmd = parseCommand(raw);
+  if (cmd) return commandAdder(raw, cmd, kind);
   if (kind !== "query") return null;
   const span = parseUrl(raw, opts).spans.find(
     (s) => s.insert && s.path.length === 1 && s.path[0] === "query",
@@ -536,17 +586,39 @@ export function adderFor(
   return (k, v) => splice(raw, [[at, at, build(k, v)]]);
 }
 
-/** The query key or header name that produced `path` in this input, for adding it elsewhere. */
-export function keyFor(
-  raw: string,
-  opts: Options,
-  path: Seg[],
-): { kind: AddKind; key: string } | null {
+export interface AddKey {
+  kind: AddKind;
+  key: string;
+  /** Text that goes before the value, such as `NAME=` for `-e NAME=value`. */
+  prefix?: string;
+  /** True for an option that has no value. */
+  flag?: boolean;
+}
+
+function commandKey(c: Command, opts: Options, path: Seg[]): AddKey | null {
+  const [head, name, ...sub] = path;
+  if (head === "env" && typeof name === "string" && !sub.length) return { kind: "env", key: name };
+  if (head !== "options" || typeof name !== "string") return null;
+  if (!sub.length) {
+    const flag = c.args.every((a) => a.kind !== "option" || a.name !== name || !a.value);
+    return { kind: "option", key: name, ...(flag && { flag: true }) };
+  }
+  if (!sub.every((s) => typeof s === "string")) return null;
+  const k = sub.join(".");
+  return key(splitKey(k, opts)) === key(sub)
+    ? { kind: "option", key: name, prefix: `${k}=` }
+    : null;
+}
+
+/** The query key, header, option or variable name that produced `path`, for adding it elsewhere. */
+export function keyFor(raw: string, opts: Options, path: Seg[]): AddKey | null {
   if (path.length === 2 && path[0] === "headers" && typeof path[1] === "string") {
     return { kind: "header", key: path[1] };
   }
+  const x = CURL.test(raw) ? curlCtx(raw) : null;
+  const cmd = x ? null : parseCommand(raw);
+  if (cmd) return commandKey(cmd, opts, path);
   if (path[0] !== "query") return null;
-  const x = /^\s*curl(?:\.exe)?\s/i.test(raw) ? curlCtx(raw) : null;
   const text = x ? x.c.url?.value : raw;
   if (!text) return null;
   const span = parseUrl(text, opts).spans.find((s) => s.edit?.prefix && key(s.path) === key(path));

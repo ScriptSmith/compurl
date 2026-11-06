@@ -406,6 +406,88 @@ describe("curl", () => {
     });
     expect(noteOf(at(root("curl https://a.test"), "method"))).toBe("inferred");
   });
+
+  it("keeps whatever follows a pipe out of the command", () => {
+    expect(tree("curl https://a.test/x | jq '.items[]'")).toMatchObject({
+      host: "a.test",
+      "followed by": "| jq '.items[]'",
+    });
+    expect(tree("curl https://a.test/x | jq .")).not.toHaveProperty("other URLs");
+  });
+});
+
+describe("other commands", () => {
+  it("splits a command into variables, program, arguments and options", () => {
+    const raw = `FOO=1 BAR="a b" node app.js --port=3000 -m "fix it, again" --tags a,b | jq .`;
+    expect(parseUrl(raw, opts).kind).toBe("command");
+    expect(tree(raw)).toEqual({
+      env: { FOO: "1", BAR: "a b" },
+      command: "node",
+      arguments: ["app.js"],
+      options: { "--port": "3000", "-m": "fix it, again", "--tags": ["a", "b"] },
+      "followed by": "| jq .",
+    });
+  });
+
+  it("guesses which options take the next argument as their value", () => {
+    expect(tree("docker run --rm -it -p 80:80 nginx bash")).toEqual({
+      command: "docker",
+      arguments: ["run", "nginx", "bash"],
+      options: { "--rm": true, "-it": true, "-p": "80:80" },
+    });
+    expect(tree("ffmpeg -i in.mp4 -crf 23 -an -O2 out.mp4").options).toEqual({
+      "-i": "in.mp4",
+      "-crf": "23",
+      "-an": true,
+      "-O2": true,
+    });
+    expect(tree("kubectl exec -n prod pod -- sh -c 'echo hi'")).toEqual({
+      command: "kubectl",
+      arguments: ["exec", "pod", "--", "sh", "-c", "echo hi"],
+      options: { "-n": "prod" },
+    });
+    expect(tree("app --offset -5 --no-color out").options).toEqual({
+      "--offset": "-5",
+      "--no-color": true,
+    });
+  });
+
+  it("groups KEY=value options by key and decodes their values", () => {
+    const t = root(example("shell"));
+    expect(plain(at(t, "options", "-e")!)).toMatchObject({
+      DATABASE_URL: { host: "db.internal", query: { sslmode: "require", pool: "10" } },
+      LOG_LEVEL: "info",
+    });
+    expect(plain(at(t, "options", "--label")!)).toEqual({
+      com: { example: { deploy: { team: "orders", tier: "web" } } },
+    });
+    expect(tree("java -Xmx2g -Dserver.port=8080 -jar app.jar").options).toEqual({
+      "-Xmx2g": true,
+      "-D": { server: { port: "8080" } },
+      "-jar": "app.jar",
+    });
+    expect(tree("tool -o json -o a=1").options).toEqual({ "-o": ["json", { a: "1" }] });
+  });
+
+  it("records spans for each option and argument", () => {
+    const raw = "docker run -p 8080:80 -e LOG_LEVEL=info nginx";
+    const visible = parseUrl(raw, opts).spans.filter((s) => !s.hidden);
+    expect(
+      visible.map((s) => [raw.slice(s.start, s.end), raw.slice(s.valueStart ?? s.start, s.end)]),
+    ).toEqual([
+      ["docker", "docker"],
+      ["run", "run"],
+      ["-p 8080:80", "8080:80"],
+      ["-e LOG_LEVEL=info", "info"],
+      ["nginx", "nginx"],
+    ]);
+  });
+
+  it("leaves URLs and query strings with spaces alone", () => {
+    expect(parseUrl("https://a.test/x?q=a b", opts).kind).toBe("url");
+    expect(parseUrl("q=red shoes&x=1", opts).kind).toBe("url");
+    expect(parseUrl("ls", opts).kind).toBe("url");
+  });
 });
 
 describe("decoders", () => {

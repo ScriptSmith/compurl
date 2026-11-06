@@ -53,3 +53,10 @@ export function shellQuote(s: string): string {
   if (/^[\w@%+=:,./-]+$/.test(s)) return s;
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
+
+/** Quotes a string for a POSIX shell the way `original`, the shell word it replaces, was quoted. */
+export function quoteLike(s: string, original: string): string {
+  if (original.startsWith("'") && !s.includes("'")) return `'${s}'`;
+  if (original.startsWith('"') && !/["\\$`]/.test(s)) return `"${s}"`;
+  return shellQuote(s);
+}

@@ -1,5 +1,6 @@
 import { parseBang, parseViewport } from "./decoders/bang.ts";
 import { base64Bytes, base64Text, inflateText, lzText } from "./decoders/compress.ts";
+import { parseCommand, splitAtOperator, type Arg, type Command } from "./decoders/command.ts";
 import { parseCurl, tokenize, type Curl, type Token } from "./decoders/curl.ts";
 import { parseJsurl } from "./decoders/jsurl.ts";
 import { protobufFromBytes } from "./decoders/protobuf.ts";
@@ -17,7 +18,9 @@ import {
   MATRIX,
   QUERY,
   QUERY_VALUE,
+  quoteLike,
   SEGMENT,
+  shellQuote,
   USERINFO,
 } from "./encode.ts";
 import type { Options } from "./options.ts";
@@ -30,6 +33,7 @@ import {
   PUSH,
   walkLeaves,
   withVia,
+  type Edit,
   type Node,
   type Obj,
   type Scalar,
@@ -43,7 +47,7 @@ export * from "./tree.ts";
 export interface Parsed {
   tree: Obj;
   spans: Span[];
-  kind: "url" | "curl";
+  kind: "url" | "curl" | "command";
   /** The URL a curl command requests. */
   url?: string;
 }
@@ -864,7 +868,7 @@ function curlTree(
   spans: Span[],
   opts: Options,
 ): { root: Obj; url?: string } {
-  const tokens = tokenize(s);
+  const { tokens, rest } = splitAtOperator(tokenize(s));
   const c = parseCurl(tokens)!;
   const root = obj("curl");
   let effective: string | undefined;
@@ -1014,7 +1018,192 @@ function curlTree(
     ]);
   }
   if (options.entries.size) root.entries.set("options", options);
+  if (rest.length) {
+    const [start, end] = [rest[0]!.start, rest[rest.length - 1]!.end];
+    root.entries.set("followed by", leaf(s.slice(start, end)));
+    add(start, end, ["followed by"]);
+  }
   return { root, url: effective };
+}
+
+const KEY_VALUE = /^([A-Za-z_][\w.\-[\]]*)=/;
+const PROSE = /^(?:comma list|pipe list|space list|search query)$/;
+
+/** Decodes a command-line argument, keeping text with spaces in it whole. */
+function argValue(v: string, opts: Options, key?: string): Node {
+  const node = decodeValue(v, opts, 1, key);
+  return node.t !== "leaf" && /\s/.test(v) && PROSE.test(node.via ?? "") ? leaf(v) : node;
+}
+
+const isKeyValue = (v: string, opts: Options) =>
+  KEY_VALUE.test(v) && !(v.includes("&") && looksLikeQuery(v, opts));
+
+type OptionArg = Extract<Arg, { kind: "option" }>;
+
+function commandTree(raw: string, c: Command, spans: Span[], opts: Options): Obj {
+  const root = obj("command");
+  const text = (t: Token) => raw.slice(t.start, t.end);
+  const { tokens } = c;
+  /** The range that deletes `first` through `last` along with the whitespace before them. */
+  const removal = (first: Token, last: Token): [number, number] => {
+    const i = tokens.indexOf(first);
+    if (i > 0) return [tokens[i - 1]!.end, last.end];
+    const next = tokens[tokens.indexOf(last) + 1];
+    return [first.start, next ? next.start : last.end];
+  };
+  const gap = (t: Token) => {
+    const i = tokens.indexOf(t);
+    return i > 0 ? raw.slice(tokens[i - 1]!.end, t.start) : " ";
+  };
+  /** Where the value starts in a raw token, after `before` such as `--name=`. */
+  const after = (t: Token, before: string) => {
+    const i = text(t).indexOf(before);
+    return i < 0 ? undefined : t.start + i + before.length;
+  };
+  const itemOf = (n: Node) => (n.t === "leaf" ? n.v : undefined);
+
+  if (c.env.length) {
+    const env = obj();
+    for (const t of c.env) {
+      const r = text(t);
+      const name = r.slice(0, r.indexOf("="));
+      const value = t.value.slice(name.length + 1);
+      const node = argValue(value, opts, name);
+      const rawValue = r.slice(name.length + 1);
+      spans.push({
+        start: t.start,
+        end: t.end,
+        valueStart: t.start + name.length + 1,
+        path: ["env", ...insert(env, [name], node)],
+        item: itemOf(node),
+        edit: {
+          range: [t.start, t.end],
+          text: value,
+          encode: (v) => `${name}=${quoteLike(v, rawValue)}`,
+          node,
+          remove: removal(t, t),
+          prefix: "",
+          sep: gap(t),
+        },
+      });
+    }
+    root.entries.set("env", env);
+  }
+
+  const p = c.program;
+  root.entries.set("command", leaf(p.value));
+  spans.push({
+    start: p.start,
+    end: p.end,
+    path: ["command"],
+    edit: { range: [p.start, p.end], text: p.value, encode: (v) => quoteLike(v, text(p)) },
+  });
+
+  const items: Node[] = [];
+  const byName = new Map<string, OptionArg[]>();
+  for (const a of c.args) {
+    if (a.kind === "option") {
+      const list = byName.get(a.name);
+      if (list) list.push(a);
+      else byName.set(a.name, [a]);
+      continue;
+    }
+    const t = a.token;
+    const node = argValue(t.value, opts);
+    const i = items.length;
+    items.push(node);
+    const edit: Edit = {
+      range: [t.start, t.end],
+      text: t.value,
+      encode: (v) => quoteLike(v, text(t)),
+      node,
+      remove: removal(t, t),
+      prefix: "",
+      sep: gap(t),
+    };
+    const leafy = node.t === "leaf";
+    spans.push(
+      { start: t.start, end: t.end, path: ["arguments"], item: itemOf(node), edit, hidden: !leafy },
+      { start: t.start, end: t.end, path: ["arguments", i], edit, hidden: leafy },
+    );
+  }
+
+  const options = obj();
+  for (const [name, list] of byName) {
+    const kv = list.every((a) => a.value && isKeyValue(a.value.value, opts));
+    const group = obj();
+    if (kv) options.entries.set(name, group);
+    for (const { flag, value, attached } of list) {
+      if (!value) {
+        spans.push({
+          start: flag.start,
+          end: flag.end,
+          path: ["options", ...insert(options, [name], leaf(true))],
+          item: true,
+          edit: {
+            range: [flag.end, flag.end],
+            text: "",
+            encode: (v) => (v === "" ? "" : ` ${shellQuote(v)}`),
+            remove: removal(flag, flag),
+            prefix: text(flag),
+            sep: gap(flag),
+          },
+        });
+        continue;
+      }
+      const key = kv ? KEY_VALUE.exec(value.value)![1]! : undefined;
+      const before = `${attached ?? ""}${key === undefined ? "" : `${key}=`}`;
+      const v = value.value.slice(before.length - (attached?.length ?? 0));
+      const node = argValue(v, opts, key ?? name.replace(/^-+/, ""));
+      const path =
+        key === undefined
+          ? ["options", ...insert(options, [name], node)]
+          : ["options", name, ...insert(group, splitKey(key, opts), node)];
+      const holder = attached === undefined ? value : flag;
+      const original = text(holder);
+      const encode = (x: string) =>
+        original.startsWith(before)
+          ? before + quoteLike(x, original.slice(before.length))
+          : quoteLike(before + x, original);
+      spans.push({
+        start: flag.start,
+        end: Math.max(flag.end, value.end),
+        valueStart: after(holder, before) ?? holder.start,
+        path,
+        item: itemOf(node),
+        edit: {
+          range: [holder.start, holder.end],
+          text: v,
+          encode,
+          node,
+          remove: removal(flag, holder),
+          prefix: attached === undefined ? raw.slice(flag.start, value.start) : "",
+          sep: gap(flag),
+        },
+      });
+    }
+  }
+
+  if (items.length) root.entries.set("arguments", arr(items));
+  if (options.entries.size) root.entries.set("options", options);
+  if (c.rest.length) {
+    const first = c.rest[0]!;
+    const last = c.rest[c.rest.length - 1]!;
+    const tail = raw.slice(first.start, last.end);
+    root.entries.set("followed by", leaf(tail));
+    spans.push({
+      start: first.start,
+      end: last.end,
+      path: ["followed by"],
+      edit: {
+        range: [first.start, last.end],
+        text: tail,
+        encode: (v) => v,
+        remove: [tokens[tokens.length - 1]!.end, last.end],
+      },
+    });
+  }
+  return root;
 }
 
 function annotate(tree: Node) {
@@ -1024,16 +1213,23 @@ function annotate(tree: Node) {
   });
 }
 
-/** Parses a URL, a bare query string or a curl command into a tree plus source ranges. */
+/** Parses a URL, a bare query string, a curl command or another shell command into a tree plus source ranges. */
 export function parseUrl(raw: string, opts: Options): Parsed {
   const spans: Span[] = [];
   const lead = raw.length - raw.trimStart().length;
   const s = raw.trim();
   const curl = CURL.test(s);
-  const { root: tree, url } = curl
-    ? curlTree(s, lead, spans, opts)
-    : { root: buildUrl(s, lead, spans, opts, 0), url: s };
-  if (opts.timestamps) annotate(tree);
+  const command = curl ? null : parseCommand(raw);
+  let parsed: Parsed;
+  if (curl) {
+    const { root, url } = curlTree(s, lead, spans, opts);
+    parsed = { tree: root, spans, kind: "curl", url };
+  } else if (command) {
+    parsed = { tree: commandTree(raw, command, spans, opts), spans, kind: "command" };
+  } else {
+    parsed = { tree: buildUrl(s, lead, spans, opts, 0), spans, kind: "url", url: s };
+  }
+  if (opts.timestamps) annotate(parsed.tree);
   spans.sort((a, b) => a.start - b.start);
-  return { tree, spans, kind: curl ? "curl" : "url", url };
+  return parsed;
 }

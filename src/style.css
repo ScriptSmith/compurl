@@ -238,6 +238,10 @@ textarea {
   cursor: pointer;
 }
 
+.icon-btn[hidden] {
+  display: none;
+}
+
 .icon-btn:hover,
 .icon-btn[aria-expanded="true"] {
   color: var(--ink);
@@ -659,7 +663,8 @@ textarea {
 }
 
 .edit-buttons button,
-.add-param {
+.add-param,
+.add-flag {
   padding: 0.25rem 0.7rem;
   border: 1px solid var(--rule-strong);
   border-radius: var(--radius);

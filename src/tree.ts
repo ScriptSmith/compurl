@@ -32,6 +32,8 @@ export interface Edit {
   remove?: [number, number];
   /** The raw text before the value, such as `key=`, for adding siblings of a repeated key. */
   prefix?: string;
+  /** What goes between this entry and an added sibling: `&` unless given. */
+  sep?: string;
 }
 
 /** A place in the raw text where new entries can be added. */

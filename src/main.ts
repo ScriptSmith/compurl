@@ -12,6 +12,7 @@ import {
 import { actionsFor, adderFor, keyFor, type Actions, type AddKind } from "./edit.ts";
 import { shellQuote } from "./encode.ts";
 import { EXAMPLES } from "./examples.ts";
+import { formatCommand, isMultiline } from "./format.ts";
 import {
   defaultOptions,
   GROUPS,
@@ -56,6 +57,18 @@ const ICON_COPY =
   '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>';
 const ICON_EDIT =
   '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 3 13 5.5 6 12.5l-3.25.75L3.5 10z"/></svg>';
+const ICON_LINES =
+  '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h11M5.5 8h8M5.5 12.5h8"/></svg>';
+
+const ADD_KINDS: Record<AddKind, { label: string; only: string }> = {
+  query: {
+    label: "Query parameter",
+    only: "Query parameters can only be added to URLs and curl commands",
+  },
+  header: { label: "Header", only: "Headers can only be added to curl commands" },
+  option: { label: "Option", only: "Options can only be added to commands other than curl" },
+  env: { label: "Environment variable", only: "Variables can only be added to commands" },
+};
 
 const $ = <T extends Element>(sel: string) => document.querySelector<T>(sel)!;
 const urlList = $<HTMLDivElement>("#urls");
@@ -111,7 +124,9 @@ function renderInputs(focus?: number) {
     .map((_, i) => {
       const L = LETTERS[i]!;
       const hint =
-        i === 0 ? "Paste a URL or a curl command" : "Paste another to compare, or leave empty";
+        i === 0
+          ? "Paste a URL, a curl command or another shell command"
+          : "Paste another to compare, or leave empty";
       return `<div class="url" style="${idVar(i)}">
         <label class="tag" for="u${i}">${L}</label>
         <div class="field">
@@ -121,6 +136,7 @@ function renderInputs(focus?: number) {
         <div class="url-actions">
           <button type="button" class="icon-btn remove" data-i="${i}" aria-label="Remove ${L}" title="Remove ${L}"></button>
           <button type="button" class="icon-btn copy-open" data-i="${i}" aria-haspopup="menu" aria-expanded="false" aria-label="Copy ${L}" title="Copy ${L}">${ICON_COPY}</button>
+          <button type="button" class="icon-btn format" data-i="${i}" hidden>${ICON_LINES}</button>
         </div>
       </div>`;
     })
@@ -130,6 +146,23 @@ function renderInputs(focus?: number) {
   });
   addBtn.disabled = state.urls.length >= MAX_URLS;
   if (focus !== undefined) urlList.querySelectorAll("textarea")[focus]?.focus();
+}
+
+/** Shows the line-layout button for commands, labelled with what it will do. */
+function renderFormatButtons() {
+  urlList.querySelectorAll<HTMLButtonElement>(".format").forEach((btn) => {
+    const i = Number(btn.dataset.i);
+    const raw = state.urls[i] ?? "";
+    const command = columns.some((c) => c.input === i && c.parsed.kind !== "url");
+    const multiline = isMultiline(raw);
+    const next = command ? formatCommand(raw, !multiline) : null;
+    btn.hidden = next === null || next === raw.trim();
+    const label = multiline
+      ? `Put ${LETTERS[i]} on one line`
+      : `Put each option in ${LETTERS[i]} on its own line`;
+    btn.setAttribute("aria-label", label);
+    btn.title = label;
+  });
 }
 
 function update() {
@@ -143,6 +176,7 @@ function update() {
       )
     : null;
   renderMirrors();
+  renderFormatButtons();
   renderResults();
   saveDraft();
 }
@@ -173,7 +207,7 @@ function mirrorHtml(
   let out = "";
   let pos = 0;
   for (const s of spans) {
-    if (s.start < pos) continue;
+    if (s.hidden || s.start < pos) continue;
     const key = pathKey(s.path);
     const row = index.get(key);
     const shared =
@@ -300,8 +334,10 @@ function editRowHtml(r: Row): string {
     } else if (!r.cells[j] && addKey) {
       const add = adderFor(raw, state.opts, addKey.kind);
       if (add) {
-        session.set(j, { add: (v) => add(addKey.key, v) });
-        body = cellInput(j, "", false, `Add to ${col.letter}`);
+        session.set(j, { add: (v) => add(addKey.key, (addKey.prefix ?? "") + v) });
+        body = addKey.flag
+          ? `<button type="button" class="add-flag" data-j="${j}">Add ${esc(addKey.key)} to ${col.letter}</button>`
+          : cellInput(j, "", false, `Add to ${col.letter}`);
       } else body = `<p class="cant">Can't add this to ${col.letter}.</p>`;
     } else {
       if (a.remove) session.set(j, a);
@@ -320,12 +356,29 @@ function editRowHtml(r: Row): string {
     ${cells.join("")}</tr>`;
 }
 
+/** What can be added to the current inputs, most common first. */
+function addKinds(): AddKind[] {
+  const kinds = new Set<AddKind>();
+  for (const c of columns) {
+    if (c.parsed.kind === "command") kinds.add("option").add("env");
+    else kinds.add("query");
+    if (c.parsed.kind === "curl") kinds.add("header");
+  }
+  return (Object.keys(ADD_KINDS) as AddKind[]).filter((k) => kinds.has(k));
+}
+
 function addRowHtml(): string {
   session = new Map();
-  const anyCurl = columns.some((c) => c.parsed.kind === "curl");
-  const kind = anyCurl
-    ? `<select class="add-kind" aria-label="What to add"><option value="query">Query parameter</option><option value="header">Header</option></select>`
-    : "";
+  const kinds = addKinds();
+  const kind =
+    kinds.length > 1
+      ? `<select class="add-kind" aria-label="What to add">${kinds
+          .map((k) => `<option value="${k}">${ADD_KINDS[k].label}</option>`)
+          .join("")}</select>`
+      : "";
+  const hint = kinds.includes("option")
+    ? "Enter to save, Esc to cancel. Leave every value empty to add an option with no value."
+    : "Enter to save, Esc to cancel";
   const cells = columns
     .map(
       (col, j) =>
@@ -337,8 +390,8 @@ function addRowHtml(): string {
         )}</div></td>`,
     )
     .join("");
-  return `<tr class="edit-row add-row" style="--depth:0">
-    <th scope="row" class="part"><input class="add-key" type="text" placeholder="Name" aria-label="Name" spellcheck="false">${kind}${editButtons}<p class="edit-hint">Enter to save, Esc to cancel</p></th>
+  return `<tr class="edit-row add-row" style="--depth:0" data-kind="${kinds[0]}">
+    <th scope="row" class="part"><input class="add-key" type="text" placeholder="Name" aria-label="Name" spellcheck="false">${kind}${editButtons}<p class="edit-hint">${hint}</p></th>
     ${cells}</tr>`;
 }
 
@@ -380,7 +433,7 @@ function collect(rows: Row[], out: string[], n: number) {
 function summaryHtml(c: Comparison, n: number): string {
   if (n === 1) {
     const col = columns[0]!;
-    const what = col.parsed.kind === "curl" ? "curl command" : "URL";
+    const what = { url: "URL", curl: "curl command", command: "command" }[col.parsed.kind];
     const total = c.counts.same + c.counts.diff + c.counts.partial;
     return `<div class="summary"><p class="tally">${plural(total, "value")} decoded from ${what} ${col.letter}. Paste another into a second field to compare them.</p>
       <div class="summary-actions"><button type="button" class="add-param">Add parameter</button></div></div>`;
@@ -448,19 +501,19 @@ function saveEdit() {
     if (editing.kind === "add") {
       const name = results.querySelector<HTMLInputElement>(".add-key")!.value.trim();
       const kind = (results.querySelector<HTMLSelectElement>(".add-kind")?.value ??
-        "query") as AddKind;
+        results.querySelector<HTMLElement>(".add-row")!.dataset.kind) as AddKind;
       const filled = [...inputs].filter((ta) => ta.value !== "");
       if (!name) return toast("Enter a name first.");
-      if (!filled.length) return toast("Enter a value for at least one URL.");
+      const flag = kind === "option" && !filled.length;
+      if (!filled.length && !flag) return toast("Enter a value for at least one input.");
       const skipped: string[] = [];
-      for (const ta of filled) {
+      for (const ta of flag ? inputs : filled) {
         const col = columns[Number(ta.dataset.j)]!;
         const add = adderFor(next[col.input]!, state.opts, kind);
         if (add) next[col.input] = add(name, ta.value);
         else skipped.push(col.letter);
       }
-      if (skipped.length)
-        toast(`Headers can only be added to curl commands. Skipped ${skipped.join(", ")}.`);
+      if (skipped.length) toast(`${ADD_KINDS[kind].only}. Skipped ${skipped.join(", ")}.`);
     } else {
       for (const ta of inputs) {
         const j = Number(ta.dataset.j);
@@ -508,10 +561,10 @@ function openCopyMenu(button: HTMLButtonElement) {
   const i = Number(button.dataset.i);
   const col = columns.find((c) => c.input === i);
   if (!col) return toast("Nothing to copy yet.");
-  const curl = col.parsed.kind === "curl";
-  const items: [string, string][] = [["text", curl ? "Copy command" : "Copy URL"]];
-  if (curl && col.parsed.url) items.push(["url", "Copy its URL"]);
-  if (!curl) items.push(["curl", "Copy as curl command"]);
+  const { kind } = col.parsed;
+  const items: [string, string][] = [["text", kind === "url" ? "Copy URL" : "Copy command"]];
+  if (kind === "curl" && col.parsed.url) items.push(["url", "Copy its URL"]);
+  if (kind === "url") items.push(["curl", "Copy as curl command"]);
   items.push(["json", "Copy decoded parts as JSON"]);
   copyMenu.innerHTML = items
     .map(
@@ -627,6 +680,19 @@ urlList.addEventListener("click", (e) => {
     }
     return;
   }
+  const format = (e.target as Element).closest<HTMLButtonElement>(".format");
+  if (format) {
+    const i = Number(format.dataset.i);
+    const raw = state.urls[i] ?? "";
+    const next = formatCommand(raw, !isMultiline(raw));
+    if (next === null) return;
+    state.urls[i] = next;
+    editing = null;
+    renderInputs();
+    update();
+    urlList.querySelector<HTMLButtonElement>(`.format[data-i="${i}"]`)?.focus();
+    return;
+  }
   const btn = (e.target as Element).closest<HTMLButtonElement>(".remove");
   if (!btn) return;
   const i = Number(btn.dataset.i);
@@ -714,6 +780,15 @@ results.addEventListener("click", (e) => {
     next[columns[j]!.input] = remove();
     return setUrls(next);
   }
+  const addFlag = target.closest<HTMLButtonElement>(".add-flag");
+  if (addFlag) {
+    const j = Number(addFlag.dataset.j);
+    const add = session.get(j)?.add;
+    if (!add) return;
+    const next = [...state.urls];
+    next[columns[j]!.input] = add("");
+    return setUrls(next);
+  }
   const cellCopy = target.closest<HTMLButtonElement>(".cell-copy");
   if (cellCopy) {
     const row = cmp?.index.get(cellCopy.closest<HTMLElement>("tr")!.dataset.k!);
@@ -774,7 +849,7 @@ copyMenu.addEventListener("click", (e) => {
   if (!col) return;
   const raw = state.urls[i]!.trim();
   const texts: Record<string, [string, string]> = {
-    text: [raw, `${col.parsed.kind === "curl" ? "Command" : "URL"} ${col.letter} copied.`],
+    text: [raw, `${col.parsed.kind === "url" ? "URL" : "Command"} ${col.letter} copied.`],
     url: [col.parsed.url ?? "", `URL from ${col.letter} copied.`],
     curl: [`curl ${shellQuote(raw)}`, `curl command for ${col.letter} copied.`],
     json: [
