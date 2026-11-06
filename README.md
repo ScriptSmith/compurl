@@ -1,12 +1,14 @@
 # compurl
 
-Paste a URL, a curl command or another shell command to see every part and parameter decoded, or
-paste up to six to compare them. compurl splits each one into scheme, host, path, query parameters
-and fragment, decodes structured values inside them, and lines the results up in one table with
-differences highlighted. Differing parts are also highlighted in the pasted text itself.
+compurl splits URLs, curl commands and other shell commands into their parts and decodes each
+one, down to values nested inside other values, such as compressed SAML XML in a query parameter
+or a redirect URL encoded twice. Paste up to six inputs to compare them in one table, with the
+differences highlighted in the table and in the pasted text. You can edit any value, and compurl
+writes the change back into the original text and re-encodes it through each layer it decoded.
 
-Everything runs in the browser. Nothing you paste is sent anywhere. The "Copy share link" button
-puts the inputs, compressed, into the link's `#` fragment, so anyone with the link can read them.
+Use it at https://adamsm.com/compurl/. Everything runs in the browser. Nothing you paste is sent
+anywhere. The "Copy share link" button puts the inputs, compressed, into the link's `#` fragment,
+so anyone with the link can read them.
 
 ## What it decodes
 
