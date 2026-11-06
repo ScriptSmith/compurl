@@ -201,6 +201,18 @@ textarea {
   text-underline-offset: 3px;
 }
 
+.mirror.solo {
+  color: var(--muted);
+}
+
+.mirror.solo .tok {
+  color: var(--ink);
+}
+
+.mirror.solo .k {
+  color: var(--muted);
+}
+
 .mirror .tok.hot {
   background: color-mix(in srgb, var(--id) 16%, transparent);
   border-radius: 2px;
@@ -236,7 +248,8 @@ textarea {
   margin: 0.875rem 0 0 2.25rem;
 }
 
-.actions button {
+.actions button,
+.actions select {
   padding: 0.375rem 0.875rem;
   border: 1px solid var(--rule-strong);
   border-radius: var(--radius);
@@ -244,7 +257,12 @@ textarea {
   cursor: pointer;
 }
 
-.actions button:hover:not(:disabled) {
+.actions select {
+  padding-right: 0.5rem;
+}
+
+.actions button:hover:not(:disabled),
+.actions select:hover {
   border-color: var(--ink);
 }
 
@@ -255,22 +273,56 @@ textarea {
 
 /* Decoder toggles */
 
-.decoders {
+.rules {
   margin: 1.75rem 0 0;
-  padding: 0;
-  border: 0;
 }
 
-.decoders legend {
-  padding: 0;
-  margin-bottom: 0.5rem;
+.rules > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  width: fit-content;
+  margin-bottom: 0.625rem;
+  cursor: pointer;
+}
+
+.rules-title {
   font-weight: 600;
 }
 
+.rules-count {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
 .decoder-list {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.rule-group {
+  display: grid;
+  grid-template-columns: 9.5rem minmax(0, 1fr);
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+}
+
+.rule-group-label {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.rule-chips {
   display: flex;
   flex-wrap: wrap;
   gap: 0.375rem;
+}
+
+@media (max-width: 640px) {
+  .rule-group {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .opt {
@@ -553,10 +605,13 @@ textarea {
 
 .via,
 .note {
-  display: inline-block;
   margin-left: 0.25rem;
   font-family: var(--font-ui);
   font-size: 0.75rem;
+}
+
+.via {
+  display: inline-block;
   white-space: nowrap;
 }
 

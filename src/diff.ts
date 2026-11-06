@@ -1,4 +1,25 @@
-import { SELF, type Arr, type Node, type Obj, type Seg } from "./parse.ts";
+import {
+  SELF,
+  type Arr,
+  type Node,
+  type Obj,
+  type Options,
+  type Scalar,
+  type Seg,
+} from "./parse.ts";
+
+export type CompareOptions = Pick<Options, "sets" | "case" | "numbers">;
+const STRICT: CompareOptions = { sets: false, case: false, numbers: false };
+const NUMERIC = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?$/i;
+
+/** A string that is equal for two scalars exactly when the comparison options treat them as equal. */
+export function itemKey(v: Scalar, o: CompareOptions = STRICT): string {
+  if (o.numbers && (typeof v === "number" || (typeof v === "string" && NUMERIC.test(v.trim())))) {
+    return `n:${Number(v)}`;
+  }
+  if (typeof v === "string") return `s:${o.case ? v.toLowerCase() : v}`;
+  return `${typeof v}:${String(v)}`;
+}
 
 export type Status = "same" | "diff" | "partial";
 
@@ -57,25 +78,30 @@ function childSegs(cells: (Node | undefined)[]): Seg[] {
   return out;
 }
 
-export function equalNode(a: Node, b: Node): boolean {
-  if (a.t === "leaf" || b.t === "leaf") return a.t === "leaf" && b.t === "leaf" && a.v === b.v;
+const sortedKeys = (n: Arr, o: CompareOptions) =>
+  n.items.map((i) => (i.t === "leaf" ? itemKey(i.v, o) : "")).sort();
+
+export function equalNode(a: Node, b: Node, o: CompareOptions = STRICT): boolean {
+  if (a.t === "leaf" || b.t === "leaf") {
+    return a.t === "leaf" && b.t === "leaf" && itemKey(a.v, o) === itemKey(b.v, o);
+  }
   if (a.t === "arr" || b.t === "arr") {
-    return (
-      a.t === "arr" &&
-      b.t === "arr" &&
-      a.items.length === b.items.length &&
-      a.items.every((x, i) => equalNode(x, b.items[i]!))
-    );
+    if (a.t !== "arr" || b.t !== "arr" || a.items.length !== b.items.length) return false;
+    if (o.sets && isFlatList(a) && isFlatList(b)) {
+      const bk = sortedKeys(b, o);
+      return sortedKeys(a, o).every((k, i) => k === bk[i]);
+    }
+    return a.items.every((x, i) => equalNode(x, b.items[i]!, o));
   }
   if (a.entries.size !== b.entries.size) return false;
   for (const [k, x] of a.entries) {
     const y = b.entries.get(k);
-    if (!y || !equalNode(x, y)) return false;
+    if (!y || !equalNode(x, y, o)) return false;
   }
   return true;
 }
 
-function statusOf(row: Row): Status {
+function statusOf(row: Row, o: CompareOptions): Status {
   const { cells } = row;
   if (cells.some((c) => !c)) return "partial";
   const first = cells[0]!;
@@ -83,10 +109,16 @@ function statusOf(row: Row): Status {
     const sameKind = cells.every((c) => c!.t === first.t);
     return sameKind && row.children.every((c) => c.status === "same") ? "same" : "diff";
   }
-  return cells.every((c) => equalNode(c!, first)) ? "same" : "diff";
+  return cells.every((c) => equalNode(c!, first, o)) ? "same" : "diff";
 }
 
-function build(cells: (Node | undefined)[], path: Seg[], depth: number, out: Comparison): Row {
+function build(
+  cells: (Node | undefined)[],
+  path: Seg[],
+  depth: number,
+  out: Comparison,
+  o: CompareOptions,
+): Row {
   const containers = cells.filter((c): c is Obj | Arr => !!c && c.t !== "leaf");
   const compact = containers.length > 0 && containers.every(isFlatList);
   const row: Row = {
@@ -105,17 +137,18 @@ function build(cells: (Node | undefined)[], path: Seg[], depth: number, out: Com
         [...path, seg],
         depth + 1,
         out,
+        o,
       ),
     );
   }
-  row.status = statusOf(row);
+  row.status = statusOf(row, o);
   if (!row.children.length) out.counts[row.status]++;
   out.index.set(row.key, row);
   return row;
 }
 
 /** Aligns the parsed trees of several URLs into rows keyed by path. */
-export function compare(trees: Obj[]): Comparison {
+export function compare(trees: Obj[], o: CompareOptions = STRICT): Comparison {
   const out: Comparison = { rows: [], index: new Map(), counts: { same: 0, diff: 0, partial: 0 } };
   out.rows = childSegs(trees).map((seg) =>
     build(
@@ -123,6 +156,7 @@ export function compare(trees: Obj[]): Comparison {
       [seg],
       0,
       out,
+      o,
     ),
   );
   return out;
@@ -192,5 +226,8 @@ function backtrack(trace: Int32Array[], D: number, n: number, m: number) {
     x = prevX;
     y = prevY;
   }
-  return { a: toRanges(del), b: toRanges(ins) };
+  const a = toRanges(del);
+  const b = toRanges(ins);
+  if (a.length + b.length > 4 && common < 0.8 * Math.max(n, m)) return null;
+  return { a, b };
 }

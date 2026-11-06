@@ -1,10 +1,18 @@
 import { describe, expect, it } from "vite-plus/test";
 import { charDiff, compare, type Row } from "./diff.ts";
-import { EXAMPLE } from "./example.ts";
-import { defaultOptions, parseUrl } from "./parse.ts";
+import { EXAMPLES } from "./examples.ts";
+import { defaultOptions, parseUrl, type Options } from "./parse.ts";
 
+const EXAMPLE = EXAMPLES[0]!.urls;
 const opts = defaultOptions();
 const run = (...urls: string[]) => compare(urls.map((u) => parseUrl(u, opts).tree));
+const runWith = (changes: Partial<Options>, ...urls: string[]) => {
+  const o = { ...opts, ...changes };
+  return compare(
+    urls.map((u) => parseUrl(u, o).tree),
+    o,
+  );
+};
 const statusOf = (c: ReturnType<typeof run>, ...path: (string | number)[]) =>
   c.index.get(JSON.stringify(path))?.status;
 
@@ -60,6 +68,45 @@ describe("compare", () => {
   it("treats a single URL as all-same", () => {
     const c = run(a);
     expect(c.counts.diff + c.counts.partial).toBe(0);
+  });
+});
+
+describe("treat as equal", () => {
+  it("compares lists in any order", () => {
+    const a = "https://a.test/?scope=openid%20email&o=b,a";
+    const b = "https://a.test/?scope=email%20openid&o=a,b";
+    expect(statusOf(run(a, b), "query", "scope")).toBe("diff");
+    expect(statusOf(runWith({ sets: true }, a, b), "query", "scope")).toBe("same");
+    expect(statusOf(runWith({ sets: true }, a, b), "query", "o")).toBe("same");
+  });
+
+  it("ignores case and number formatting", () => {
+    const a = "https://a.test/?theme=Dark&n=1.0&z=007";
+    const b = "https://a.test/?theme=dark&n=1&z=7";
+    expect(statusOf(run(a, b), "query")).toBe("diff");
+    const c = runWith({ case: true, numbers: true }, a, b);
+    expect([
+      statusOf(c, "query", "theme"),
+      statusOf(c, "query", "n"),
+      statusOf(c, "query", "z"),
+    ]).toEqual(["same", "same", "same"]);
+  });
+
+  it("ignores URL variations", () => {
+    const a = "https://www.a.test:443/x/";
+    const b = "https://a.test/x";
+    expect(run(a, b).counts.same).toBe(1);
+    expect(runWith({ loose: true }, a, b).counts).toEqual({ same: 3, diff: 0, partial: 0 });
+  });
+
+  it("lines up a curl command with a plain URL", () => {
+    const c = run(
+      "https://api.test/v1/items?id=3",
+      "curl 'https://api.test/v1/items?id=4' -H 'Accept: */*'",
+    );
+    expect(statusOf(c, "host")).toBe("same");
+    expect(statusOf(c, "query", "id")).toBe("diff");
+    expect(statusOf(c, "method")).toBe("partial");
   });
 });
 

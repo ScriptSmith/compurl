@@ -2,16 +2,18 @@ import "./style.css";
 import {
   charDiff,
   compare,
+  itemKey,
   label,
   pathKey,
   type Comparison,
   type Range,
   type Row,
 } from "./diff.ts";
-import { EXAMPLE } from "./example.ts";
+import { EXAMPLES } from "./examples.ts";
 import {
-  DECODERS,
   defaultOptions,
+  GROUPS,
+  OPTIONS,
   parseUrl,
   type Arr,
   type DecoderId,
@@ -46,6 +48,9 @@ const $ = <T extends Element>(sel: string) => document.querySelector<T>(sel)!;
 const urlList = $<HTMLDivElement>("#urls");
 const addBtn = $<HTMLButtonElement>("#add");
 const decoderList = $<HTMLDivElement>("#decoders");
+const rulesPanel = $<HTMLDetailsElement>("#rules");
+const rulesCount = $<HTMLSpanElement>("#rules-count");
+const exampleSelect = $<HTMLSelectElement>("#example");
 const decoderHelp = $<HTMLDListElement>("#decoder-help");
 const results = $<HTMLElement>("#results");
 const toastEl = $<HTMLDivElement>("#toast");
@@ -53,25 +58,46 @@ const toastEl = $<HTMLDivElement>("#toast");
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 const idVar = (input: number) => `--id: var(--id-${input})`;
-const offList = () => DECODERS.filter((d) => !state.opts[d.id]).map((d) => d.id);
+const changed = () => ({
+  off: OPTIONS.filter((o) => o.on && !state.opts[o.id]).map((o) => o.id),
+  on: OPTIONS.filter((o) => !o.on && state.opts[o.id]).map((o) => o.id),
+});
+
+function renderRulesCount() {
+  const { off, on } = changed();
+  const parts = [
+    on.length && `${on.length} turned on`,
+    off.length && `${off.length} turned off`,
+  ].filter(Boolean);
+  rulesCount.textContent = parts.length ? `${parts.join(", ")} from the defaults` : "Defaults";
+}
 
 function renderDecoders() {
-  decoderList.innerHTML = DECODERS.map(
-    (d) =>
-      `<label class="opt" title="${esc(d.example)}"><input type="checkbox" data-id="${d.id}"${
-        state.opts[d.id] ? " checked" : ""
-      }><span>${esc(d.label)}</span></label>`,
+  decoderList.innerHTML = GROUPS.map(
+    (g) => `<div class="rule-group" role="group" aria-label="${esc(g.label)}">
+      <span class="rule-group-label">${esc(g.label)}</span>
+      <div class="rule-chips">${g.options
+        .map(
+          (o) =>
+            `<label class="opt" title="${esc(o.example)}"><input type="checkbox" data-id="${o.id}"${
+              state.opts[o.id] ? " checked" : ""
+            }><span>${esc(o.label)}</span></label>`,
+        )
+        .join("")}</div>
+    </div>`,
   ).join("");
-  decoderHelp.innerHTML = DECODERS.map(
-    (d) => `<dt>${esc(d.label)}</dt><dd>${esc(d.example)}</dd>`,
+  decoderHelp.innerHTML = OPTIONS.map(
+    (o) => `<dt>${esc(o.label)}</dt><dd>${esc(o.example)}</dd>`,
   ).join("");
+  renderRulesCount();
 }
 
 function renderInputs(focus?: number) {
   urlList.innerHTML = state.urls
     .map((_, i) => {
       const L = LETTERS[i]!;
-      const hint = i === 0 ? "https://example.com/page?param=value" : "Paste a URL to compare";
+      const hint =
+        i === 0 ? "Paste a URL or a curl command" : "Paste another to compare, or leave empty";
       return `<div class="url" style="${idVar(i)}">
         <label class="tag" for="u${i}">${L}</label>
         <div class="field">
@@ -93,7 +119,12 @@ function update() {
   columns = state.urls.flatMap((u, i) =>
     u.trim() ? [{ input: i, letter: LETTERS[i]!, parsed: parseUrl(u, state.opts) }] : [],
   );
-  cmp = columns.length ? compare(columns.map((c) => c.parsed.tree)) : null;
+  cmp = columns.length
+    ? compare(
+        columns.map((c) => c.parsed.tree),
+        state.opts,
+      )
+    : null;
   renderMirrors();
   renderResults();
   saveDraft();
@@ -109,22 +140,35 @@ function schedule() {
   }
 }
 
-const hasItem = (n: Node | undefined, v: Leaf["v"]) =>
-  n?.t === "arr" ? n.items.some((i) => i.t === "leaf" && i.v === v) : n?.t === "leaf" && n.v === v;
+const itemKeys = (n: Node | undefined) =>
+  new Set(
+    n?.t === "arr"
+      ? n.items.map((i) => (i.t === "leaf" ? itemKey(i.v, state.opts) : ""))
+      : [n?.t === "leaf" ? itemKey(n.v, state.opts) : ""],
+  );
 
-function mirrorHtml(text: string, spans: Span[], index: Comparison["index"]): string {
+function mirrorHtml(
+  text: string,
+  spans: Span[],
+  index: Comparison["index"],
+  solo: boolean,
+): string {
   let out = "";
   let pos = 0;
-  for (const s of [...spans].sort((a, b) => a.start - b.start)) {
+  for (const s of spans) {
     if (s.start < pos) continue;
     const key = pathKey(s.path);
     const row = index.get(key);
     const shared =
-      row?.compact && s.item !== undefined && row.cells.every((c) => hasItem(c, s.item!));
-    const st = shared ? "same" : (row?.status ?? "same");
+      row?.compact &&
+      s.item !== undefined &&
+      row.cells.every((c) => itemKeys(c).has(itemKey(s.item!, state.opts)));
+    const st = solo ? "solo" : shared ? "same" : (row?.status ?? "same");
     const raw = text.slice(s.start, s.end);
     let body = esc(raw);
-    if (st === "diff") {
+    if (st === "solo" && s.valueStart !== undefined) {
+      body = `<span class="k">${esc(text.slice(s.start, s.valueStart))}</span>${esc(text.slice(s.valueStart, s.end))}`;
+    } else if (st === "diff") {
       body =
         s.valueStart === undefined
           ? `<mark>${esc(raw)}</mark>`
@@ -142,10 +186,10 @@ function renderMirrors() {
   pres.forEach((pre, i) => {
     const text = state.urls[i] ?? "";
     const col = columns.find((c) => c.input === i);
+    const solo = columns.length === 1;
+    pre.classList.toggle("solo", !!col && solo);
     pre.innerHTML =
-      col && cmp && columns.length > 1
-        ? mirrorHtml(text, col.parsed.spans, cmp.index)
-        : esc(text) + " ";
+      col && cmp ? mirrorHtml(text, col.parsed.spans, cmp.index, solo) : esc(text) + " ";
   });
   hot = null;
 }
@@ -172,8 +216,10 @@ function inlineRanges(r: Row, j: number): Range[] {
   return other === null ? [] : (charDiff(mine, other)?.a ?? []);
 }
 
-const viaTag = (via?: string) =>
-  via && via !== "query" ? ` <span class="via">${esc(via)}</span>` : "";
+const viaTag = (via: string | undefined, r: Row) =>
+  via && via !== "query" && via !== r.path[r.path.length - 1]
+    ? ` <span class="via">${esc(via)}</span>`
+    : "";
 const scalarText = (v: Leaf["v"]) =>
   v === "" ? `<span class="empty">empty</span>` : esc(typeof v === "string" ? v : String(v));
 
@@ -186,22 +232,17 @@ function leafHtml(c: Leaf, r: Row, j: number): string {
 }
 
 function listHtml(c: Arr, r: Row, j: number): string {
-  const values = (n: Node | undefined) =>
-    new Set(
-      n?.t === "arr"
-        ? n.items.map((i) => (i.t === "leaf" ? i.v : null))
-        : [n?.t === "leaf" ? n.v : null],
-    );
-  const others = r.cells.filter((x, i) => i !== j && x).map(values);
+  const others = r.cells.filter((x, i) => i !== j && x).map(itemKeys);
   const flag = r.status !== "same" && columns.length > 1;
   const chips = c.items
     .map((i) => {
       const v = i.t === "leaf" ? i.v : null;
-      const odd = flag && others.some((s) => !s.has(v));
+      const odd =
+        flag && others.some((s) => !s.has(i.t === "leaf" ? itemKey(i.v, state.opts) : ""));
       return `<span class="chip${odd ? " odd" : ""}">${scalarText(v)}</span>`;
     })
     .join("");
-  return `<span class="list">${chips || '<span class="empty">no items</span>'}</span>${viaTag(c.via)}`;
+  return `<span class="list">${chips || '<span class="empty">no items</span>'}</span>${viaTag(c.via, r)}`;
 }
 
 function cellHtml(c: Node, r: Row, j: number): string {
@@ -210,7 +251,7 @@ function cellHtml(c: Node, r: Row, j: number): string {
   const count = c.t === "obj" ? c.entries.size : c.items.length;
   const params = c.via === "query" || c.via === "hash params" || c.via === "query string";
   const noun = c.t === "arr" ? "item" : params ? "parameter" : "key";
-  return `<span class="count">${plural(count, noun)}</span>${viaTag(c.via)}`;
+  return `<span class="count">${plural(count, noun)}</span>${viaTag(c.via, r)}`;
 }
 
 function rowHtml(r: Row, n: number): string {
@@ -247,7 +288,10 @@ function collect(rows: Row[], out: string[], n: number) {
 
 function summaryHtml(c: Comparison, n: number): string {
   if (n === 1) {
-    return `<div class="summary"><p class="tally">Showing how URL ${columns[0]!.letter} decodes. Add another URL to compare.</p></div>`;
+    const col = columns[0]!;
+    const what = col.parsed.kind === "curl" ? "curl command" : "URL";
+    const total = c.counts.same + c.counts.diff + c.counts.partial;
+    return `<div class="summary"><p class="tally">${plural(total, "value")} decoded from ${what} ${col.letter}. Paste another into a second field to compare them.</p></div>`;
   }
   const { same, diff, partial } = c.counts;
   return `<div class="summary">
@@ -261,7 +305,7 @@ function summaryHtml(c: Comparison, n: number): string {
 
 function renderResults() {
   if (!cmp) {
-    results.innerHTML = `<p class="empty-state">Paste a URL above to see its parts, or load the example. Add a second URL to compare them.</p>`;
+    results.innerHTML = `<p class="empty-state">Paste a URL or curl command above to see its parts, or pick an example. Fill a second field to compare them.</p>`;
     return;
   }
   const n = columns.length;
@@ -311,7 +355,7 @@ function toast(msg: string) {
 
 function saveDraft() {
   try {
-    const draft: Shared = { urls: state.urls, off: offList(), only: state.only };
+    const draft: Shared = { urls: state.urls, ...changed(), only: state.only };
     sessionStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
   } catch {
     // Storage can be unavailable in private windows; the draft is a convenience.
@@ -332,6 +376,7 @@ function apply(s: Shared) {
   while (state.urls.length < 2) state.urls.push("");
   state.opts = defaultOptions();
   for (const id of s.off) state.opts[id] = false;
+  for (const id of s.on) state.opts[id] = true;
   state.only = s.only;
   state.collapsed.clear();
   renderDecoders();
@@ -388,15 +433,22 @@ addBtn.addEventListener("click", () => {
   update();
 });
 
-$("#example").addEventListener("click", () => {
-  state.urls = [...EXAMPLE];
+exampleSelect.insertAdjacentHTML(
+  "beforeend",
+  EXAMPLES.map((e) => `<option value="${e.id}">${esc(e.label)}</option>`).join(""),
+);
+exampleSelect.addEventListener("change", () => {
+  const example = EXAMPLES.find((e) => e.id === exampleSelect.value);
+  exampleSelect.value = "";
+  if (!example) return;
+  state.urls = [...example.urls];
   state.collapsed.clear();
   renderInputs();
   update();
 });
 
 $("#share").addEventListener("click", async () => {
-  const hash = await encodeShare({ urls: state.urls, off: offList(), only: state.only });
+  const hash = await encodeShare({ urls: state.urls, ...changed(), only: state.only });
   history.replaceState(null, "", hash);
   try {
     await navigator.clipboard.writeText(location.href);
@@ -409,7 +461,25 @@ $("#share").addEventListener("click", async () => {
 decoderList.addEventListener("change", (e) => {
   const input = e.target as HTMLInputElement;
   state.opts[input.dataset.id as DecoderId] = input.checked;
+  renderRulesCount();
   update();
+});
+
+const RULES_KEY = "compurl:rules-open";
+try {
+  const saved = localStorage.getItem(RULES_KEY);
+  if (saved === "false" || (saved === null && matchMedia("(max-width: 640px)").matches)) {
+    rulesPanel.open = false;
+  }
+} catch {
+  // Remembering the panel state is optional.
+}
+rulesPanel.addEventListener("toggle", () => {
+  try {
+    localStorage.setItem(RULES_KEY, String(rulesPanel.open));
+  } catch {
+    // Remembering the panel state is optional.
+  }
 });
 
 results.addEventListener("click", (e) => {

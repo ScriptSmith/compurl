@@ -20,8 +20,8 @@
     <header class="masthead">
       <h1 class="wordmark">compurl</h1>
       <p class="lede">
-        Paste two or more URLs to see which parts and parameters differ. Decoding runs in this page,
-        and nothing you paste is sent anywhere.
+        Paste a URL or curl command to see every part and parameter decoded, or paste several to see
+        where they differ. Decoding runs in this page, and nothing you paste is sent anywhere.
       </p>
     </header>
 
@@ -30,21 +30,26 @@
         <div id="urls" class="url-list"></div>
         <div class="actions">
           <button type="button" id="add">Add URL</button>
-          <button type="button" id="example">Load example</button>
+          <select id="example" aria-label="Load an example">
+            <option value="">Load an example…</option>
+          </select>
           <button type="button" id="share">Copy share link</button>
         </div>
       </section>
 
-      <fieldset class="decoders">
-        <legend>Decode values and keys as</legend>
+      <details id="rules" class="rules" open>
+        <summary>
+          <span class="rules-title">Decoding and comparison rules</span>
+          <span id="rules-count" class="rules-count"></span>
+        </summary>
         <div id="decoders" class="decoder-list"></div>
         <details class="decoder-details">
           <summary>What each rule does</summary>
           <dl id="decoder-help"></dl>
         </details>
-      </fieldset>
+      </details>
 
-      <section id="results" class="results" aria-label="Comparison"></section>
+      <section id="results" class="results" aria-label="Decoded parts"></section>
     </main>
 
     <div id="toast" class="toast" role="status" hidden></div>

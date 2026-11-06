@@ -2,7 +2,9 @@ import { DECODERS, type DecoderId } from "./parse.ts";
 
 export interface Shared {
   urls: string[];
+  /** Options switched away from their defaults. */
   off: DecoderId[];
+  on: DecoderId[];
   only: boolean;
 }
 
@@ -50,8 +52,7 @@ export function sanitize(v: unknown): Shared | null {
   const r = v as Record<string, unknown>;
   if (!Array.isArray(r.urls)) return null;
   const urls = r.urls.filter((u): u is string => typeof u === "string").slice(0, 6);
-  const off = Array.isArray(r.off)
-    ? r.off.filter((d): d is DecoderId => typeof d === "string" && IDS.has(d))
-    : [];
-  return { urls: urls.length ? urls : [""], off, only: r.only === true };
+  const ids = (v: unknown) =>
+    Array.isArray(v) ? v.filter((d): d is DecoderId => typeof d === "string" && IDS.has(d)) : [];
+  return { urls: urls.length ? urls : [""], off: ids(r.off), on: ids(r.on), only: r.only === true };
 }
