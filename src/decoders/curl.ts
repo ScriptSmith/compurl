@@ -101,7 +101,7 @@ export function tokenize(s: string): Token[] {
 }
 
 const SHORT_WITH_ARG = new Set("XHdFubAeoxUmwTEcrzKyYDCPQt");
-const SHORT_FLAGS: Record<string, string> = {
+export const SHORT_FLAGS: Record<string, string> = {
   s: "silent",
   S: "show-error",
   L: "location",
@@ -283,6 +283,9 @@ export interface Curl {
   urlQuery: Token[];
   /** Other options, by long name, with their value token or null for plain flags. */
   options: { name: string; token: Token; value: Token | null }[];
+  /** The option token that each value token belongs to. */
+  flags: Map<Token, Token>;
+  tokens: Token[];
 }
 
 const URLISH = /^(?:[a-z][a-z0-9+.-]*:\/\/|[\w.-]+\.[a-z]{2,}(?:[:/?#]|$)|localhost|\[)/i;
@@ -298,9 +301,12 @@ export function parseCurl(tokens: Token[]): Curl | null {
     cookies: [],
     urlQuery: [],
     options: [],
+    flags: new Map(),
+    tokens,
   };
 
   const apply = (name: string, flag: Token, value: Token | null) => {
+    if (value && value !== flag) out.flags.set(value, flag);
     switch (name) {
       case "request":
         out.method = value!;

@@ -29,6 +29,19 @@ curl commands, including multi-line ones from a browser's "Copy as cURL", become
 URL's parts, headers (with `Authorization` and `Cookie` decoded), cookies, body, form fields and
 flags. A curl command and a plain URL line up row for row, so the two can be compared directly.
 
+## Editing and copying
+
+Each row has an edit button (or double-click a value). Editing a row shows one input per URL, so a
+value can be changed, added or removed in each one separately. compurl writes the change back into
+the original text, re-encoding through every layer it decoded: an edit to a field inside base64
+JSON, a JWT, Rison, JSURL, a nested or double-encoded URL, a cookie or a curl body comes back out
+encoded the same way. The rest of the text is left untouched. JWT signatures are kept as they are,
+so they no longer match after an edit. "Add parameter" adds a query parameter, or a header to curl
+commands.
+
+The copy button next to each input copies it as typed, as a curl command (or the URL from a curl
+command), or as decoded JSON. Each value in the table has its own copy button too.
+
 ## Development
 
 This project uses [Vite+](https://viteplus.dev). The `vp` CLI comes from the local `vite-plus`

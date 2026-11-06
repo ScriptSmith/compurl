@@ -9,12 +9,15 @@ import {
   type Range,
   type Row,
 } from "./diff.ts";
+import { actionsFor, adderFor, keyFor, type Actions, type AddKind } from "./edit.ts";
+import { shellQuote } from "./encode.ts";
 import { EXAMPLES } from "./examples.ts";
 import {
   defaultOptions,
   GROUPS,
   OPTIONS,
   parseUrl,
+  toPlain,
   type Arr,
   type DecoderId,
   type Leaf,
@@ -44,6 +47,16 @@ const state = {
 let columns: Column[] = [];
 let cmp: Comparison | null = null;
 
+/** The row being edited, or the row for adding a parameter. */
+let editing: { kind: "row"; key: string; focus?: number } | { kind: "add" } | null = null;
+/** What each column's editor can do, filled in when the edit row renders. */
+let session = new Map<number, Actions & { add?: (value: string) => string }>();
+
+const ICON_COPY =
+  '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>';
+const ICON_EDIT =
+  '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 3 13 5.5 6 12.5l-3.25.75L3.5 10z"/></svg>';
+
 const $ = <T extends Element>(sel: string) => document.querySelector<T>(sel)!;
 const urlList = $<HTMLDivElement>("#urls");
 const addBtn = $<HTMLButtonElement>("#add");
@@ -53,6 +66,7 @@ const rulesCount = $<HTMLSpanElement>("#rules-count");
 const exampleSelect = $<HTMLSelectElement>("#example");
 const decoderHelp = $<HTMLDListElement>("#decoder-help");
 const results = $<HTMLElement>("#results");
+const copyMenu = $<HTMLDivElement>("#copy-menu");
 const toastEl = $<HTMLDivElement>("#toast");
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -104,7 +118,10 @@ function renderInputs(focus?: number) {
           <pre class="mirror" aria-hidden="true"></pre>
           <textarea id="u${i}" data-i="${i}" rows="1" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="${hint}" aria-label="URL ${L}"></textarea>
         </div>
-        <button type="button" class="remove" data-i="${i}" aria-label="Remove URL ${L}" title="Remove URL ${L}"></button>
+        <div class="url-actions">
+          <button type="button" class="icon-btn remove" data-i="${i}" aria-label="Remove ${L}" title="Remove ${L}"></button>
+          <button type="button" class="icon-btn copy-open" data-i="${i}" aria-haspopup="menu" aria-expanded="false" aria-label="Copy ${L}" title="Copy ${L}">${ICON_COPY}</button>
+        </div>
       </div>`;
     })
     .join("");
@@ -254,7 +271,79 @@ function cellHtml(c: Node, r: Row, j: number): string {
   return `<span class="count">${plural(count, noun)}</span>${viaTag(c.via, r)}`;
 }
 
+function cellInput(j: number, value: string, multiline: boolean, placeholder: string): string {
+  const rows = Math.min(12, Math.max(1, value.split("\n").length));
+  return `<textarea class="cell-input" data-j="${j}" rows="${rows}" spellcheck="false"${
+    multiline ? ' data-multiline="1"' : ""
+  } placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}">${esc(value)}</textarea>`;
+}
+
+const editButtons = `<div class="edit-buttons">
+    <button type="button" class="save-edit">Save</button>
+    <button type="button" class="cancel-edit">Cancel</button>
+  </div>`;
+
+function editRowHtml(r: Row): string {
+  session = new Map();
+  const full = r.path.map(label).join(" › ");
+  const addKey =
+    columns.map((c) => keyFor(state.urls[c.input]!, state.opts, r.path)).find(Boolean) ?? null;
+  let multiline = false;
+  const cells = columns.map((col, j) => {
+    const raw = state.urls[col.input]!;
+    const a = actionsFor(raw, state.opts, r.path);
+    let body: string;
+    if (a.apply) {
+      session.set(j, a);
+      multiline ||= !!a.multiline;
+      body = cellInput(j, a.current ?? "", !!a.multiline, `Value in ${col.letter}`);
+    } else if (!r.cells[j] && addKey) {
+      const add = adderFor(raw, state.opts, addKey.kind);
+      if (add) {
+        session.set(j, { add: (v) => add(addKey.key, v) });
+        body = cellInput(j, "", false, `Add to ${col.letter}`);
+      } else body = `<p class="cant">Can't add this to ${col.letter}.</p>`;
+    } else {
+      if (a.remove) session.set(j, a);
+      body = `<p class="cant">${r.cells[j] ? "This value can't be edited directly." : "Not present."}</p>`;
+    }
+    const remove = a.remove
+      ? `<button type="button" class="link remove-value" data-j="${j}">Remove from ${col.letter}</button>`
+      : "";
+    return `<td data-col="${col.letter}" style="${idVar(col.input)}" class="editing"><div class="edit-cell">${body}${remove}</div></td>`;
+  });
+  const hint = multiline
+    ? "Ctrl+Enter to save, one value per line"
+    : "Enter to save, Esc to cancel";
+  return `<tr class="edit-row" style="--depth:${r.depth}" data-k="${esc(r.key)}">
+    <th scope="row" class="part" title="${esc(full)}"><span class="key">${esc(label(r.path[r.path.length - 1]!))}</span>${editButtons}<p class="edit-hint">${hint}</p></th>
+    ${cells.join("")}</tr>`;
+}
+
+function addRowHtml(): string {
+  session = new Map();
+  const anyCurl = columns.some((c) => c.parsed.kind === "curl");
+  const kind = anyCurl
+    ? `<select class="add-kind" aria-label="What to add"><option value="query">Query parameter</option><option value="header">Header</option></select>`
+    : "";
+  const cells = columns
+    .map(
+      (col, j) =>
+        `<td data-col="${col.letter}" style="${idVar(col.input)}" class="editing"><div class="edit-cell">${cellInput(
+          j,
+          "",
+          false,
+          `Value for ${col.letter}, or leave empty`,
+        )}</div></td>`,
+    )
+    .join("");
+  return `<tr class="edit-row add-row" style="--depth:0">
+    <th scope="row" class="part"><input class="add-key" type="text" placeholder="Name" aria-label="Name" spellcheck="false">${kind}${editButtons}<p class="edit-hint">Enter to save, Esc to cancel</p></th>
+    ${cells}</tr>`;
+}
+
 function rowHtml(r: Row, n: number): string {
+  if (editing?.kind === "row" && editing.key === r.key) return editRowHtml(r);
   const st = n > 1 ? r.status : "solo";
   const full = r.path.map(label).join(" › ");
   const k = esc(r.key);
@@ -262,16 +351,18 @@ function rowHtml(r: Row, n: number): string {
   const twisty = r.children.length
     ? `<button type="button" class="twisty" data-k="${k}" aria-expanded="${open}" aria-label="${open ? "Collapse" : "Expand"} ${esc(full)}"></button>`
     : "";
-  const part = `<th scope="row" class="part" title="${esc(full)}">${twisty}<span class="key">${esc(label(r.path[r.path.length - 1]!))}</span></th>`;
+  const edit = `<button type="button" class="icon-btn row-edit" data-k="${k}" aria-label="Edit ${esc(full)}" title="Edit">${ICON_EDIT}</button>`;
+  const part = `<th scope="row" class="part" title="${esc(full)}">${twisty}<span class="key">${esc(label(r.path[r.path.length - 1]!))}</span>${edit}</th>`;
+  const copy = `<button type="button" class="icon-btn cell-copy" aria-label="Copy value" title="Copy value">${ICON_COPY}</button>`;
   const cells =
     st === "same"
-      ? `<td class="shared" colspan="${n}" data-col="All"><div>${cellHtml(r.cells[0]!, r, 0)}</div></td>`
+      ? `<td class="shared" colspan="${n}" data-col="All" data-j="0"><div>${cellHtml(r.cells[0]!, r, 0)}</div>${copy}</td>`
       : r.cells
           .map((c, j) => {
             const col = columns[j]!;
-            const attrs = `data-col="${col.letter}" style="${idVar(col.input)}"`;
+            const attrs = `data-col="${col.letter}" data-j="${j}" style="${idVar(col.input)}"`;
             return c
-              ? `<td ${attrs}><div>${cellHtml(c, r, j)}</div></td>`
+              ? `<td ${attrs}><div>${cellHtml(c, r, j)}</div>${copy}</td>`
               : `<td ${attrs} class="absent"><div>not present</div></td>`;
           })
           .join("");
@@ -291,7 +382,8 @@ function summaryHtml(c: Comparison, n: number): string {
     const col = columns[0]!;
     const what = col.parsed.kind === "curl" ? "curl command" : "URL";
     const total = c.counts.same + c.counts.diff + c.counts.partial;
-    return `<div class="summary"><p class="tally">${plural(total, "value")} decoded from ${what} ${col.letter}. Paste another into a second field to compare them.</p></div>`;
+    return `<div class="summary"><p class="tally">${plural(total, "value")} decoded from ${what} ${col.letter}. Paste another into a second field to compare them.</p>
+      <div class="summary-actions"><button type="button" class="add-param">Add parameter</button></div></div>`;
   }
   const { same, diff, partial } = c.counts;
   return `<div class="summary">
@@ -299,7 +391,10 @@ function summaryHtml(c: Comparison, n: number): string {
       <span class="count-diff">${diff} different</span>,
       <span class="count-partial">${partial} missing from some URLs</span>,
       <span class="count-same">${same} identical</span>.</p>
-    <label class="switch"><input type="checkbox" id="only"${state.only ? " checked" : ""}><span>Only show differences</span></label>
+    <div class="summary-actions">
+      <button type="button" class="add-param">Add parameter</button>
+      <label class="switch"><input type="checkbox" id="only"${state.only ? " checked" : ""}><span>Only show differences</span></label>
+    </div>
   </div>`;
 }
 
@@ -309,7 +404,8 @@ function renderResults() {
     return;
   }
   const n = columns.length;
-  const rows: string[] = [];
+  if (editing?.kind === "row" && !cmp.index.has(editing.key)) editing = null;
+  const rows: string[] = editing?.kind === "add" ? [addRowHtml()] : [];
   collect(cmp.rows, rows, n);
   if (!rows.length) {
     rows.push(
@@ -327,6 +423,110 @@ function renderResults() {
       <thead><tr><th scope="col">Part</th>${heads}</tr></thead>
       <tbody>${rows.join("")}</tbody>
     </table></div>`;
+  if (editing) {
+    const focus = editing.kind === "row" ? editing.focus : undefined;
+    const target =
+      editing.kind === "add"
+        ? results.querySelector<HTMLElement>(".add-key")
+        : (results.querySelector<HTMLElement>(`.cell-input[data-j="${focus ?? ""}"]`) ??
+          results.querySelector<HTMLElement>(".edit-row .cell-input, .edit-row button"));
+    target?.focus();
+  }
+}
+
+function setUrls(next: string[]) {
+  state.urls = next;
+  renderInputs();
+  update();
+}
+
+function saveEdit() {
+  if (!editing) return;
+  const next = [...state.urls];
+  const inputs = results.querySelectorAll<HTMLTextAreaElement>(".edit-row .cell-input");
+  try {
+    if (editing.kind === "add") {
+      const name = results.querySelector<HTMLInputElement>(".add-key")!.value.trim();
+      const kind = (results.querySelector<HTMLSelectElement>(".add-kind")?.value ??
+        "query") as AddKind;
+      const filled = [...inputs].filter((ta) => ta.value !== "");
+      if (!name) return toast("Enter a name first.");
+      if (!filled.length) return toast("Enter a value for at least one URL.");
+      const skipped: string[] = [];
+      for (const ta of filled) {
+        const col = columns[Number(ta.dataset.j)]!;
+        const add = adderFor(next[col.input]!, state.opts, kind);
+        if (add) next[col.input] = add(name, ta.value);
+        else skipped.push(col.letter);
+      }
+      if (skipped.length)
+        toast(`Headers can only be added to curl commands. Skipped ${skipped.join(", ")}.`);
+    } else {
+      for (const ta of inputs) {
+        const j = Number(ta.dataset.j);
+        const col = columns[j]!;
+        const s = session.get(j);
+        if (s?.apply && ta.value !== s.current) next[col.input] = s.apply(ta.value);
+        else if (s?.add && ta.value !== "") next[col.input] = s.add(ta.value);
+      }
+    }
+  } catch (e) {
+    toast(`Couldn't save that: ${(e as Error).message}`);
+    return;
+  }
+  editing = null;
+  setUrls(next);
+}
+
+function cancelEdit() {
+  const key = editing?.kind === "row" ? editing.key : null;
+  editing = null;
+  renderResults();
+  if (key) results.querySelector<HTMLElement>(`.row-edit[data-k="${CSS.escape(key)}"]`)?.focus();
+}
+
+async function copyText(text: string, done: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(done);
+  } catch {
+    toast("Couldn't copy to the clipboard.");
+  }
+}
+
+let menuButton: HTMLButtonElement | null = null;
+
+function closeCopyMenu(refocus = false) {
+  if (copyMenu.hidden) return;
+  copyMenu.hidden = true;
+  menuButton?.setAttribute("aria-expanded", "false");
+  if (refocus) menuButton?.focus();
+  menuButton = null;
+}
+
+function openCopyMenu(button: HTMLButtonElement) {
+  const i = Number(button.dataset.i);
+  const col = columns.find((c) => c.input === i);
+  if (!col) return toast("Nothing to copy yet.");
+  const curl = col.parsed.kind === "curl";
+  const items: [string, string][] = [["text", curl ? "Copy command" : "Copy URL"]];
+  if (curl && col.parsed.url) items.push(["url", "Copy its URL"]);
+  if (!curl) items.push(["curl", "Copy as curl command"]);
+  items.push(["json", "Copy decoded parts as JSON"]);
+  copyMenu.innerHTML = items
+    .map(
+      ([id, text]) =>
+        `<button type="button" role="menuitem" data-copy="${id}" data-i="${i}">${text}</button>`,
+    )
+    .join("");
+  copyMenu.hidden = false;
+  const r = button.getBoundingClientRect();
+  const width = copyMenu.offsetWidth;
+  copyMenu.style.top = `${r.bottom + window.scrollY + 4}px`;
+  copyMenu.style.left = `${Math.max(16, Math.min(r.right - width, document.documentElement.clientWidth - width - 16)) + window.scrollX}px`;
+  button.setAttribute("aria-expanded", "true");
+  menuButton = button;
+  copyMenu.querySelector<HTMLButtonElement>("button")?.focus();
 }
 
 let hot: string | null = null;
@@ -388,6 +588,7 @@ urlList.addEventListener("input", (e) => {
   const ta = e.target;
   if (!(ta instanceof HTMLTextAreaElement)) return;
   state.urls[Number(ta.dataset.i)] = ta.value;
+  editing = null;
   const pre = ta.previousElementSibling;
   if (pre) pre.textContent = ta.value + " ";
   schedule();
@@ -417,6 +618,15 @@ urlList.addEventListener("paste", (e) => {
 });
 
 urlList.addEventListener("click", (e) => {
+  const open = (e.target as Element).closest<HTMLButtonElement>(".copy-open");
+  if (open) {
+    if (menuButton === open) closeCopyMenu();
+    else {
+      closeCopyMenu();
+      openCopyMenu(open);
+    }
+    return;
+  }
   const btn = (e.target as Element).closest<HTMLButtonElement>(".remove");
   if (!btn) return;
   const i = Number(btn.dataset.i);
@@ -483,7 +693,36 @@ rulesPanel.addEventListener("toggle", () => {
 });
 
 results.addEventListener("click", (e) => {
-  const btn = (e.target as Element).closest<HTMLButtonElement>(".twisty");
+  const target = e.target as Element;
+  if (target.closest(".save-edit")) return saveEdit();
+  if (target.closest(".cancel-edit")) return cancelEdit();
+  if (target.closest(".add-param")) {
+    editing = { kind: "add" };
+    return renderResults();
+  }
+  const rowEdit = target.closest<HTMLButtonElement>(".row-edit");
+  if (rowEdit) {
+    editing = { kind: "row", key: rowEdit.dataset.k! };
+    return renderResults();
+  }
+  const removeValue = target.closest<HTMLButtonElement>(".remove-value");
+  if (removeValue) {
+    const j = Number(removeValue.dataset.j);
+    const remove = session.get(j)?.remove;
+    if (!remove) return;
+    const next = [...state.urls];
+    next[columns[j]!.input] = remove();
+    return setUrls(next);
+  }
+  const cellCopy = target.closest<HTMLButtonElement>(".cell-copy");
+  if (cellCopy) {
+    const row = cmp?.index.get(cellCopy.closest<HTMLElement>("tr")!.dataset.k!);
+    const node = row?.cells[Number(cellCopy.closest<HTMLElement>("td")!.dataset.j)];
+    if (!node) return;
+    const text = node.t === "leaf" ? String(node.v) : JSON.stringify(toPlain(node), null, 2);
+    return void copyText(text, "Value copied.");
+  }
+  const btn = target.closest<HTMLButtonElement>(".twisty");
   if (!btn) return;
   const k = btn.dataset.k!;
   if (state.collapsed.has(k)) state.collapsed.delete(k);
@@ -500,6 +739,68 @@ results.addEventListener("change", (e) => {
   saveDraft();
   $<HTMLInputElement>("#only").focus();
 });
+
+results.addEventListener("dblclick", (e) => {
+  const td = (e.target as Element).closest<HTMLElement>("td[data-j]");
+  const tr = td?.closest<HTMLElement>("tr[data-k]");
+  if (!td || !tr || tr.classList.contains("edit-row")) return;
+  editing = { kind: "row", key: tr.dataset.k!, focus: Number(td.dataset.j) };
+  renderResults();
+});
+
+results.addEventListener("keydown", (e) => {
+  const el = e.target as HTMLElement;
+  if (!el.closest(".edit-row")) return;
+  if (e.key === "Escape") {
+    e.preventDefault();
+    cancelEdit();
+  } else if (
+    e.key === "Enter" &&
+    (e.ctrlKey ||
+      e.metaKey ||
+      (!e.shiftKey && !(el as HTMLTextAreaElement).dataset?.multiline && el.tagName !== "SELECT"))
+  ) {
+    e.preventDefault();
+    saveEdit();
+  }
+});
+
+copyMenu.addEventListener("click", (e) => {
+  const item = (e.target as Element).closest<HTMLButtonElement>("[data-copy]");
+  if (!item) return;
+  const i = Number(item.dataset.i);
+  const col = columns.find((c) => c.input === i);
+  closeCopyMenu(true);
+  if (!col) return;
+  const raw = state.urls[i]!.trim();
+  const texts: Record<string, [string, string]> = {
+    text: [raw, `${col.parsed.kind === "curl" ? "Command" : "URL"} ${col.letter} copied.`],
+    url: [col.parsed.url ?? "", `URL from ${col.letter} copied.`],
+    curl: [`curl ${shellQuote(raw)}`, `curl command for ${col.letter} copied.`],
+    json: [
+      JSON.stringify(toPlain(col.parsed.tree), null, 2),
+      `Decoded parts of ${col.letter} copied.`,
+    ],
+  };
+  const [text, done] = texts[item.dataset.copy!]!;
+  void copyText(text, done);
+});
+
+copyMenu.addEventListener("keydown", (e) => {
+  const items = [...copyMenu.querySelectorAll<HTMLButtonElement>("button")];
+  const i = items.indexOf(document.activeElement as HTMLButtonElement);
+  if (e.key === "Escape") closeCopyMenu(true);
+  else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    items[(i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length]?.focus();
+  }
+});
+
+document.addEventListener("click", (e) => {
+  const t = e.target as Element;
+  if (!copyMenu.hidden && !copyMenu.contains(t) && !t.closest(".copy-open")) closeCopyMenu();
+});
+window.addEventListener("resize", () => closeCopyMenu());
 
 results.addEventListener("mouseover", (e) => {
   setHot((e.target as Element).closest<HTMLElement>("tr[data-k]")?.dataset.k ?? null);

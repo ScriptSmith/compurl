@@ -20,8 +20,9 @@
     <header class="masthead">
       <h1 class="wordmark">compurl</h1>
       <p class="lede">
-        Paste a URL or curl command to see every part and parameter decoded, or paste several to see
-        where they differ. Decoding runs in this page, and nothing you paste is sent anywhere.
+        Paste a URL or curl command to see every part and parameter decoded and edit any of them, or
+        paste several to see where they differ. Decoding runs in this page, and nothing you paste is
+        sent anywhere.
       </p>
     </header>
 
@@ -52,6 +53,7 @@
       <section id="results" class="results" aria-label="Decoded parts"></section>
     </main>
 
+    <div id="copy-menu" class="menu" role="menu" aria-label="Copy" hidden></div>
     <div id="toast" class="toast" role="status" hidden></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

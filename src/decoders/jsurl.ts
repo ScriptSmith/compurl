@@ -76,3 +76,24 @@ export function parseJsurl(s: string): unknown {
   if (i !== s.length) fail();
   return v;
 }
+
+const encode = (s: string) =>
+  s.replace(/[^\w.-]/g, (c) => {
+    if (c === "$") return "!";
+    const code = c.charCodeAt(0);
+    return code < 0x100
+      ? `*${code.toString(16).padStart(2, "0")}`
+      : `**${code.toString(16).padStart(4, "0")}`;
+  });
+
+export function stringifyJsurl(v: unknown): string {
+  if (v === null || v === undefined) return "~null";
+  if (typeof v === "boolean") return `~${v}`;
+  if (typeof v === "number")
+    return Number.isFinite(v) ? `~${String(v).replace(/\+/g, "")}` : "~null";
+  if (typeof v === "string") return `~'${encode(v)}`;
+  if (Array.isArray(v)) return `~(${v.map(stringifyJsurl).join("") || "~"})`;
+  return `~(${Object.entries(v as Record<string, unknown>)
+    .map(([k, x]) => encode(k) + stringifyJsurl(x))
+    .join("~")})`;
+}

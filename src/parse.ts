@@ -9,6 +9,17 @@ import { annotateSigned } from "./decoders/signed.ts";
 import { timeNote } from "./decoders/time.ts";
 import { itsdangerous, jwt, paseto, rails } from "./decoders/tokens.ts";
 import { parseXml } from "./decoders/xml.ts";
+import {
+  encodeLike,
+  encodeRaw,
+  FRAGMENT,
+  INTENT,
+  MATRIX,
+  QUERY,
+  QUERY_VALUE,
+  SEGMENT,
+  USERINFO,
+} from "./encode.ts";
 import type { Options } from "./options.ts";
 import {
   arr,
@@ -33,6 +44,8 @@ export interface Parsed {
   tree: Obj;
   spans: Span[];
   kind: "url" | "curl";
+  /** The URL a curl command requests. */
+  url?: string;
 }
 
 const MAX_DEPTH = 8;
@@ -50,7 +63,7 @@ const DEFAULT_PORTS: Record<string, string> = {
   ftp: "21",
 };
 
-type Add = (start: number, end: number, path: Seg[], valueStart?: number, item?: Scalar) => void;
+type Add = (start: number, end: number, path: Seg[], more?: Partial<Span>) => void;
 
 export function decodePct(s: string): string {
   try {
@@ -279,12 +292,37 @@ function parseQuery(
         ? leaf("", "no value")
         : decodeValue(decodeForm(part.slice(eq + 1)), opts, depth, segs[segs.length - 1]);
     const path = insert(q, segs, value);
-    spans?.push({
+    if (!spans) continue;
+    const end = start + part.length;
+    const rawValue = eq < 0 ? "" : part.slice(eq + 1);
+    const style = opts.semicolons
+      ? { ...QUERY_VALUE, reserved: `${QUERY_VALUE.reserved};` }
+      : QUERY_VALUE;
+    const remove: [number, number] =
+      at > 0
+        ? [start - 1, end]
+        : at + part.length < text.length
+          ? [start, end + 1]
+          : [offset > 0 ? start - 1 : start, end];
+    spans.push({
       start,
-      end: start + part.length,
+      end,
       valueStart: eq < 0 ? undefined : start + eq + 1,
       path: [...base, ...path],
       item: value.t === "leaf" ? value.v : undefined,
+      edit: {
+        range: [eq < 0 ? end : start + eq + 1, end],
+        text: eq < 0 ? "" : decodeForm(rawValue),
+        encode: (v) =>
+          eq < 0
+            ? v === ""
+              ? ""
+              : `=${encodeLike(v, "", style)}`
+            : encodeLike(v, rawValue, style),
+        node: value,
+        remove,
+        prefix: part.slice(0, eq < 0 ? part.length : eq + 1),
+      },
     });
   }
   if (opts.signed) annotateSigned(q);
@@ -306,10 +344,24 @@ function parseAuthority(
     const colon = info.indexOf(":");
     const user = colon < 0 ? info : info.slice(0, colon);
     root.entries.set("user", leaf(decodePct(user)));
-    add(off, off + user.length, ["user"]);
+    add(off, off + user.length, ["user"], {
+      edit: {
+        range: [off, off + user.length],
+        text: decodePct(user),
+        encode: (v) => encodeLike(v, user, USERINFO),
+      },
+    });
     if (colon >= 0) {
-      root.entries.set("password", leaf(decodePct(info.slice(colon + 1))));
-      add(off + colon + 1, off + at, ["password"]);
+      const password = info.slice(colon + 1);
+      root.entries.set("password", leaf(decodePct(password)));
+      add(off + colon + 1, off + at, ["password"], {
+        edit: {
+          range: [off + colon + 1, off + at],
+          text: decodePct(password),
+          encode: (v) => encodeLike(v, password, USERINFO),
+          remove: [off + colon, off + at],
+        },
+      });
     }
     hostStart = at + 1;
   }
@@ -320,10 +372,21 @@ function parseAuthority(
   let hostValue = decodePct(host).toLowerCase();
   if (opts.loose) hostValue = hostValue.replace(/^www\./, "");
   root.entries.set("host", leaf(hostValue));
-  add(off + hostStart, off + hostStart + host.length, ["host"]);
+  const hostRange: [number, number] = [off + hostStart, off + hostStart + host.length];
+  add(...hostRange, ["host"], {
+    edit: { range: hostRange, text: host, encode: (v) => encodeRaw(v, "/?#@") },
+  });
   if (port && !(opts.loose && scheme && DEFAULT_PORTS[scheme] === port)) {
     root.entries.set("port", leaf(port));
-    add(off + hostStart + host.length + 1, off + hostStart + hp.length, ["port"]);
+    const portRange: [number, number] = [hostRange[1] + 1, off + hostStart + hp.length];
+    add(...portRange, ["port"], {
+      edit: {
+        range: portRange,
+        text: port,
+        encode: (v) => v.replace(/\D/g, ""),
+        remove: [hostRange[1], portRange[1]],
+      },
+    });
   }
 }
 
@@ -349,6 +412,10 @@ function parsePath(path: string, off: number, root: Obj, add: Add, opts: Options
   const kept: Node[] = [];
   const segOpts = SEGMENT_DECODERS(opts);
   let pos = off;
+  add(off, off + path.length, ["path"], {
+    hidden: true,
+    edit: { range: [off, off + path.length], text: path, encode: (v) => encodeRaw(v, "?#") },
+  });
   const segs = path.split("/");
   segs.forEach((seg, i) => {
     let name = seg;
@@ -369,7 +436,18 @@ function parsePath(path: string, off: number, root: Obj, add: Add, opts: Options
               ? leaf("", "no value")
               : decodeValue(decodePct(kv.slice(eq + 1)), opts, depth, k);
           const sub = insert(p, [k], v);
-          add(ppos, ppos + kv.length, ["matrix", key, ...sub], eq < 0 ? undefined : ppos + eq + 1);
+          const rawValue = eq < 0 ? "" : kv.slice(eq + 1);
+          add(ppos, ppos + kv.length, ["matrix", key, ...sub], {
+            valueStart: eq < 0 ? undefined : ppos + eq + 1,
+            edit: {
+              range: [eq < 0 ? ppos + kv.length : ppos + eq + 1, ppos + kv.length],
+              text: decodePct(rawValue),
+              encode: (x) =>
+                eq < 0 ? `=${encodeLike(x, "", MATRIX)}` : encodeLike(x, rawValue, MATRIX),
+              node: v,
+              remove: [ppos - 1, ppos + kv.length],
+            },
+          });
         }
         ppos += kv.length + 1;
       }
@@ -384,14 +462,35 @@ function parsePath(path: string, off: number, root: Obj, add: Add, opts: Options
       if (viewport) maps.entries.set("viewport", fromJson(viewport));
       if (bang) maps.entries.set("data", fromJson(bang));
       if (viewport || bang) {
-        add(pos, pos + name.length, ["maps", viewport ? "viewport" : "data"]);
+        const skip = viewport ? 0 : 5;
+        const raw = name.slice(skip);
+        add(pos, pos + name.length, ["maps", viewport ? "viewport" : "data"], {
+          edit: {
+            range: [pos + skip, pos + name.length],
+            text: decodePct(raw),
+            encode: (v) => encodeLike(v, raw, SEGMENT),
+            remove: [pos - 1, pos + name.length],
+          },
+        });
         handled = true;
       }
     }
     if (!handled && !(i === 0 && name === "")) {
-      if (opts.segments)
-        kept.push(decoded.length >= 16 ? decodeValue(decoded, segOpts, depth) : leaf(decoded));
-      add(pos, pos + name.length, ["path"], undefined, opts.segments ? decoded : undefined);
+      add(pos, pos + name.length, ["path"], { item: opts.segments ? decoded : undefined });
+      if (opts.segments) {
+        const node = decoded.length >= 16 ? decodeValue(decoded, segOpts, depth) : leaf(decoded);
+        add(pos, pos + name.length, ["path", kept.length], {
+          hidden: true,
+          edit: {
+            range: [pos, pos + name.length],
+            text: decoded,
+            encode: (v) => encodeLike(v, name, SEGMENT),
+            node,
+            remove: [pos - 1, pos + name.length],
+          },
+        });
+        kept.push(node);
+      }
     }
     pos += seg.length + 1;
   });
@@ -437,6 +536,14 @@ function parseIntent(frag: string, off: number, root: Obj, add: Add, opts: Optio
     const k = eq < 0 ? item : item.slice(0, eq);
     const v = decodePct(eq < 0 ? "" : item.slice(eq + 1));
     const valueStart = eq < 0 ? undefined : at + eq + 1;
+    const rawValue = eq < 0 ? "" : item.slice(eq + 1);
+    const edit = (node: Node) => ({
+      range: [eq < 0 ? at + item.length : at + eq + 1, at + item.length] as [number, number],
+      text: v,
+      encode: (x: string) => (eq < 0 ? "=" : "") + encodeLike(x, rawValue, INTENT),
+      node,
+      remove: [at - 1, at + item.length] as [number, number],
+    });
     const extra = /^([SBbcdfils])\.(.+)$/.exec(k);
     if (extra) {
       const [, type, name] = extra;
@@ -449,10 +556,11 @@ function parseIntent(frag: string, off: number, root: Obj, add: Add, opts: Optio
               ? leaf(v, "char")
               : leaf(Number.isFinite(Number(v)) ? Number(v) : v, INTENT_TYPES[type!]);
       extras.entries.set(name!, value);
-      add(at, at + item.length, ["fragment", "extras", name!], valueStart);
+      add(at, at + item.length, ["fragment", "extras", name!], { valueStart, edit: edit(value) });
     } else {
-      node.entries.set(k, decodeValue(v, { ...opts, lists: false, spaces: false }, depth, k));
-      add(at, at + item.length, ["fragment", k], valueStart);
+      const value = decodeValue(v, { ...opts, lists: false, spaces: false }, depth, k);
+      node.entries.set(k, value);
+      add(at, at + item.length, ["fragment", k], { valueStart, edit: edit(value) });
     }
   }
   if (extras.entries.size) node.entries.set("extras", extras);
@@ -476,20 +584,37 @@ function parseTextFragment(frag: string, off: number, root: Obj, add: Add) {
   const node = obj("text fragment");
   const i = frag.indexOf(":~:");
   if (i > 0) {
-    node.entries.set("anchor", leaf(decodePct(frag.slice(0, i))));
-    add(off, off + i, ["fragment", "anchor"]);
+    const anchor = frag.slice(0, i);
+    node.entries.set("anchor", leaf(decodePct(anchor)));
+    add(off, off + i, ["fragment", "anchor"], {
+      edit: {
+        range: [off, off + i],
+        text: decodePct(anchor),
+        encode: (v) => encodeLike(v, anchor, FRAGMENT),
+      },
+    });
   }
   let pos = i + 3;
-  for (const d of frag.slice(i + 3).split("&")) {
+  const directives = frag.slice(i + 3).split("&");
+  directives.forEach((d, n) => {
     const at = off + pos;
     pos += d.length + 1;
-    if (!d) continue;
+    if (!d) return;
     const eq = d.indexOf("=");
     const name = eq < 0 ? d : d.slice(0, eq);
     const raw = eq < 0 ? "" : d.slice(eq + 1);
     const path = insert(node, [name], name === "text" ? textDirective(raw) : leaf(decodePct(raw)));
-    add(at, at + d.length, ["fragment", ...path], eq < 0 ? undefined : at + eq + 1);
-  }
+    const end = at + d.length;
+    add(at, end, ["fragment", ...path], {
+      valueStart: eq < 0 ? undefined : at + eq + 1,
+      edit: {
+        range: [eq < 0 ? end : at + eq + 1, end],
+        text: raw,
+        encode: (v) => (eq < 0 ? "=" : "") + encodeRaw(v, "#&"),
+        remove: n > 0 ? [at - 1, end] : directives.length > 1 ? [at, end + 1] : [off + i, end],
+      },
+    });
+  });
   root.entries.set("fragment", node);
 }
 
@@ -509,6 +634,21 @@ function parseFragment(
   opts: Options,
   depth: number,
 ) {
+  const special =
+    (opts.intent && frag.startsWith("Intent;")) ||
+    (opts.textfrag && frag.includes(":~:")) ||
+    /^!?\//.test(frag);
+  if (special) {
+    add(off, off + frag.length, ["fragment"], {
+      hidden: true,
+      edit: {
+        range: [off, off + frag.length],
+        text: frag,
+        encode: (v) => encodeRaw(v, "#"),
+        remove: [off - 1, off + frag.length],
+      },
+    });
+  }
   if (opts.intent && frag.startsWith("Intent;"))
     return parseIntent(frag, off, root, add, opts, depth);
   if (opts.textfrag && frag.includes(":~:")) return parseTextFragment(frag, off, root, add);
@@ -517,7 +657,13 @@ function parseFragment(
     const q = frag.indexOf("?");
     const route = q < 0 ? frag : frag.slice(0, q);
     node.entries.set("route", leaf(decodePct(route)));
-    add(off, off + route.length, ["fragment", "route"]);
+    add(off, off + route.length, ["fragment", "route"], {
+      edit: {
+        range: [off, off + route.length],
+        text: decodePct(route),
+        encode: (v) => encodeLike(v, route, { ...FRAGMENT, reserved: "#%?" }),
+      },
+    });
     if (q >= 0) {
       const query = parseQuery(
         frag.slice(q + 1),
@@ -535,17 +681,38 @@ function parseFragment(
   }
   const decoded = decodePct(frag);
   const format = decodeValue(decoded, FRAGMENT_FORMATS(opts), depth);
+  const whole = (node: Node, hidden: boolean) =>
+    add(off, off + frag.length, ["fragment"], {
+      hidden,
+      edit: {
+        range: [off, off + frag.length],
+        text: decoded,
+        encode: (v) => encodeLike(v, frag, FRAGMENT),
+        node,
+        remove: [off - 1, off + frag.length],
+      },
+    });
   if (format.t !== "leaf" || format.note) {
     root.entries.set("fragment", format);
-    add(off, off + frag.length, ["fragment"]);
+    whole(format, false);
   } else if (/^[^=&]+=/.test(frag)) {
     root.entries.set(
       "fragment",
       parseQuery(frag, off, ["fragment"], spans, opts, depth, "hash params"),
     );
+    add(off, off + frag.length, ["fragment"], {
+      hidden: true,
+      edit: {
+        range: [off, off + frag.length],
+        text: frag,
+        encode: (v) => encodeRaw(v, "#"),
+        remove: [off - 1, off + frag.length],
+      },
+    });
   } else {
-    root.entries.set("fragment", decodeValue(decoded, opts, depth, "fragment"));
-    add(off, off + frag.length, ["fragment"]);
+    const node = decodeValue(decoded, opts, depth, "fragment");
+    root.entries.set("fragment", node);
+    whole(node, false);
   }
 }
 
@@ -558,13 +725,20 @@ function buildUrl(
   via?: string,
   root: Obj = obj(via),
 ): Obj {
-  const add: Add = (start, end, path, valueStart, item) => {
-    if (spans && end > start) spans.push({ start, end, path, valueStart, item });
+  const add: Add = (start, end, path, more = {}) => {
+    if (spans && (end > start || more.hidden)) spans.push({ start, end, path, ...more });
   };
+
+  const keyOf = (k: string) => encodeLike(k, "[].", QUERY);
+  const valueOf = (v: string) => encodeLike(v, ",:/@", QUERY_VALUE);
 
   if (!SCHEME.test(s) && !/^[/?#]/.test(s) && /^[^/?#=&]+=/.test(s)) {
     const q = parseQuery(s, offset, ["query"], spans, opts, depth, "query");
     if (q.entries.size) root.entries.set("query", q);
+    add(offset + s.length, offset + s.length, ["query"], {
+      hidden: true,
+      insert: { at: offset + s.length, build: (k, v) => `&${keyOf(k)}=${valueOf(v)}` },
+    });
     return root;
   }
 
@@ -574,7 +748,10 @@ function buildUrl(
   const lowerScheme = scheme?.toLowerCase();
   if (lowerScheme !== undefined) {
     root.entries.set("scheme", leaf(lowerScheme));
-    add(offset + idx[1]![0], offset + idx[1]![1], ["scheme"]);
+    const range: [number, number] = [offset + idx[1]![0], offset + idx[1]![1]];
+    add(...range, ["scheme"], {
+      edit: { range, text: scheme!, encode: (v) => v.replace(/[^\w+.-]/g, "") },
+    });
   }
   if (authority !== undefined)
     parseAuthority(authority, offset + idx[2]![0], root, add, opts, lowerScheme);
@@ -583,6 +760,29 @@ function buildUrl(
     const q = parseQuery(query, offset + idx[4]![0], ["query"], spans, opts, depth, "query");
     if (q.entries.size) root.entries.set("query", q);
   }
+  const queryEnd =
+    query !== undefined
+      ? offset + idx[4]![1]
+      : fragment !== undefined
+        ? offset + idx[5]![0] - 1
+        : offset + s.length;
+  add(queryEnd, queryEnd, ["query"], {
+    hidden: true,
+    insert: {
+      at: queryEnd,
+      build: (k, v) =>
+        `${query === undefined ? "?" : query === "" ? "" : "&"}${keyOf(k)}=${valueOf(v)}`,
+    },
+    edit:
+      query === undefined
+        ? undefined
+        : {
+            range: [offset + idx[4]![0], queryEnd],
+            text: query,
+            encode: (v) => encodeRaw(v, "#"),
+            remove: [offset + idx[4]![0] - 1, queryEnd],
+          },
+  });
   if (fragment) parseFragment(fragment, offset + idx[5]![0], root, spans, add, opts, depth);
   return root;
 }
@@ -608,7 +808,7 @@ function parseCookies(text: string, opts: Options, depth: number): Obj {
   return o;
 }
 
-function headerValue(name: string, value: string, opts: Options, depth: number): Node {
+export function headerValue(name: string, value: string, opts: Options, depth = 1): Node {
   const hopts: Options = {
     ...opts,
     spaces: false,
@@ -658,11 +858,17 @@ function bodyText(c: Curl): { text: string; token?: Token } {
   return { text: parts.join("&"), token: single };
 }
 
-function curlTree(s: string, lead: number, spans: Span[], opts: Options): Obj {
+function curlTree(
+  s: string,
+  lead: number,
+  spans: Span[],
+  opts: Options,
+): { root: Obj; url?: string } {
   const tokens = tokenize(s);
   const c = parseCurl(tokens)!;
   const root = obj("curl");
-  const add: Add = (start, end, path, valueStart, item) => {
+  let effective: string | undefined;
+  const add = (start: number, end: number, path: Seg[], valueStart?: number, item?: Scalar) => {
     if (end > start)
       spans.push({
         start: lead + start,
@@ -696,9 +902,10 @@ function curlTree(s: string, lead: number, spans: Span[], opts: Options): Obj {
     const urlSpans: Span[] = [];
     buildUrl(url, off ?? 0, off === null ? null : urlSpans, opts, 0, undefined, root);
     for (const sp of urlSpans) {
-      if (sp.start < (off ?? 0) + c.url.value.length)
+      if (!sp.hidden && sp.start < (off ?? 0) + c.url.value.length)
         add(sp.start, sp.end, sp.path, sp.valueStart, sp.item);
     }
+    effective = url;
   }
   if (c.extraUrls.length)
     root.entries.set("other URLs", arr(c.extraUrls.map((t) => decodeValue(t.value, opts, 1))));
@@ -772,7 +979,8 @@ function curlTree(s: string, lead: number, spans: Span[], opts: Options): Obj {
         1,
         "form body",
       );
-      for (const sp of bodySpans) add(sp.start, sp.end, sp.path, sp.valueStart, sp.item);
+      for (const sp of bodySpans)
+        if (!sp.hidden) add(sp.start, sp.end, sp.path, sp.valueStart, sp.item);
     } else node = decodeValue(body, opts, 1);
     root.entries.set("body", node);
     if (!(node.t === "obj" && node.via === "form body" && start !== null)) {
@@ -806,7 +1014,7 @@ function curlTree(s: string, lead: number, spans: Span[], opts: Options): Obj {
     ]);
   }
   if (options.entries.size) root.entries.set("options", options);
-  return root;
+  return { root, url: effective };
 }
 
 function annotate(tree: Node) {
@@ -822,8 +1030,10 @@ export function parseUrl(raw: string, opts: Options): Parsed {
   const lead = raw.length - raw.trimStart().length;
   const s = raw.trim();
   const curl = CURL.test(s);
-  const tree = curl ? curlTree(s, lead, spans, opts) : buildUrl(s, lead, spans, opts, 0);
+  const { root: tree, url } = curl
+    ? curlTree(s, lead, spans, opts)
+    : { root: buildUrl(s, lead, spans, opts, 0), url: s };
   if (opts.timestamps) annotate(tree);
   spans.sort((a, b) => a.start - b.start);
-  return { tree, spans, kind: curl ? "curl" : "url" };
+  return { tree, spans, kind: curl ? "curl" : "url", url };
 }

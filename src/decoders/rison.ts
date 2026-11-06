@@ -73,3 +73,19 @@ export function parseRison(s: string): unknown {
   if (i !== s.length) fail();
   return v;
 }
+
+const ID = /^[^\s'!:(),*@$\-\d][^\s'!:(),*@$]*$/;
+
+const risonString = (s: string) => (ID.test(s) ? s : `'${s.replace(/[!']/g, "!$&")}'`);
+
+export function stringifyRison(v: unknown): string {
+  if (v === null || v === undefined) return "!n";
+  if (v === true) return "!t";
+  if (v === false) return "!f";
+  if (typeof v === "number") return Number.isFinite(v) ? String(v).replace("+", "") : "!n";
+  if (typeof v === "string") return risonString(v);
+  if (Array.isArray(v)) return `!(${v.map(stringifyRison).join(",")})`;
+  return `(${Object.entries(v as Record<string, unknown>)
+    .map(([k, x]) => `${risonString(k)}:${stringifyRison(x)}`)
+    .join(",")})`;
+}

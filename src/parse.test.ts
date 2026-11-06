@@ -69,7 +69,8 @@ describe("URL structure", () => {
   it("records spans that point at the raw text", () => {
     const raw = "  https://a.test/x/y?o.apps=a,b&k=v";
     const { spans } = parseUrl(raw, opts);
-    expect(spans.map((s) => [raw.slice(s.start, s.end), s.path.join(".")])).toEqual([
+    const visible = spans.filter((s) => !s.hidden);
+    expect(visible.map((s) => [raw.slice(s.start, s.end), s.path.join(".")])).toEqual([
       ["https", "scheme"],
       ["a.test", "host"],
       ["x", "path"],

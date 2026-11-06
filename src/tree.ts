@@ -18,6 +18,28 @@ export interface Arr {
 }
 export type Node = Leaf | Obj | Arr;
 
+/** How to change the value behind a span by rewriting the raw text. */
+export interface Edit {
+  /** Raw range that the encoded value replaces. */
+  range: [number, number];
+  /** The value as the user sees and edits it. */
+  text: string;
+  /** Turns edited text back into raw text for `range`. */
+  encode: (text: string) => string;
+  /** The decoded form of `text`, for edits further down the tree. */
+  node?: Node;
+  /** Raw range to delete to remove this entry, separator included. */
+  remove?: [number, number];
+  /** The raw text before the value, such as `key=`, for adding siblings of a repeated key. */
+  prefix?: string;
+}
+
+/** A place in the raw text where new entries can be added. */
+export interface Insert {
+  at: number;
+  build: (key: string, value: string) => string;
+}
+
 /** A range of the raw input that produced the value at `path`. */
 export interface Span {
   start: number;
@@ -26,6 +48,10 @@ export interface Span {
   path: Seg[];
   /** The decoded value when this span holds one plain value, such as one of several repeated keys. */
   item?: Scalar;
+  edit?: Edit;
+  insert?: Insert;
+  /** Used for editing only, not highlighted. */
+  hidden?: boolean;
 }
 
 /** Key used when a path holds both its own value and nested keys, as in `a=1&a.b=2`. */
@@ -112,6 +138,15 @@ export function put(o: Record<string, unknown>, key: string, value: unknown) {
   }
 }
 const REPEATS = new WeakSet<unknown[]>();
+
+/** Converts a tree into plain JSON values. */
+export function toPlain(n: Node): unknown {
+  if (n.t === "leaf") return n.v;
+  if (n.t === "arr") return n.items.map(toPlain);
+  return Object.fromEntries(
+    [...n.entries].map(([k, v]) => [k === SELF ? "(own value)" : k, toPlain(v)]),
+  );
+}
 
 export function walkLeaves(n: Node, fn: (leaf: Leaf, key: Seg | undefined) => void, key?: Seg) {
   if (n.t === "leaf") fn(n, key);
